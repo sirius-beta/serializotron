@@ -1,10 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE LambdaCase #-}
 
 module Main where
 
 import Codec.Compression.GZip qualified as GZip
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
 import Data.Char (chr)
@@ -12,8 +11,8 @@ import Data.Text qualified as Text
 import Data.Word (Word8)
 import Serializotron
 import System.Environment (getArgs, getProgName)
-import System.Exit (ExitCode(..), exitFailure, exitSuccess)
-import System.IO (stderr, hPutStrLn, stdout)
+import System.Exit (ExitCode (..), exitFailure, exitSuccess)
+import System.IO (hPutStrLn, stderr, stdout)
 import System.Process (readProcessWithExitCode)
 import Text.Printf (printf)
 
@@ -22,13 +21,13 @@ main = do
   args <- getArgs
   case args of
     [] -> usage >> exitFailure
-    ("cat":file:[]) -> cmdCat file
-    ("pretty":file:[]) -> cmdPretty file
-    ("inspect":file:[]) -> cmdInspect file
-    ("fsck":file:[]) -> cmdFsck file
-    ("help":[]) -> usage >> exitSuccess
-    ("--help":[]) -> usage >> exitSuccess
-    ("-h":[]) -> usage >> exitSuccess
+    ["cat", file] -> cmdCat file
+    ["pretty", file] -> cmdPretty file
+    ["inspect", file] -> cmdInspect file
+    ["fsck", file] -> cmdFsck file
+    ["help"] -> usage >> exitSuccess
+    ["--help"] -> usage >> exitSuccess
+    ["-h"] -> usage >> exitSuccess
     _ -> do
       hPutStrLn stderr "Error: Invalid command or arguments"
       usage
@@ -67,7 +66,6 @@ readSztFile path = do
             GZipCompression ->
               return $ Right $ LBS.toStrict $ GZip.decompress $ LBS.fromStrict payloadBytes
 
-
 -- | cat command: output raw protobuf bytes
 cmdCat :: FilePath -> IO ()
 cmdCat file = do
@@ -93,7 +91,7 @@ cmdPretty file = do
     readProcessWithExitCode "sh" ["-c", fullCmd] ""
 
   putStr output
-  when (not $ null errOutput) $
+  unless (null errOutput) $
     hPutStrLn stderr errOutput
 
   case exitCode of
@@ -156,11 +154,11 @@ cmdFsck file = do
   printf "  Total references: %d\n" (_fsckTotalReferences stats)
   printf "  Dangling references: %d\n" (_fsckDanglingReferences stats)
 
-  when (not $ null errors) $ do
+  unless (null errors) $ do
     printf "\nErrors (%d):\n" (length errors)
     mapM_ (putStrLn . ("  - " ++) . show) errors
 
-  when (not $ null warnings) $ do
+  unless (null warnings) $ do
     printf "\nWarnings (%d):\n" (length warnings)
     mapM_ (putStrLn . ("  - " ++) . show) warnings
 

@@ -1,10 +1,9 @@
 module Main where
 
 import Serializotron
+import Serializotron.Examples qualified as E
 import Serializotron.Instances ()
 import Text.Pretty.Simple (pPrint)
-
-import Serializotron.Examples qualified as E
 
 main :: IO ()
 main = do

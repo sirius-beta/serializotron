@@ -4,8 +4,8 @@
 module Serializotron.Examples where
 
 import Data.Aeson (ToJSON (toJSON))
-import qualified Data.Aeson as Aeson
-import qualified Data.Aeson.Key as AesonKey
+import Data.Aeson qualified as Aeson
+import Data.Aeson.Key qualified as AesonKey
 import Data.Char qualified as Char
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -397,26 +397,25 @@ enterpriseSnapshot =
           let leadId = head teamIds
               statusCycle = [Active, Planned, OnHold, Active, Completed]
               statusValue = statusCycle !! (projectIdx `mod` length statusCycle)
-           in
-          Project
-            { projectCode = deptCode <> Text.pack (show (100 + projectIdx)),
-              projectName = deptName <> " Initiative " <> Text.pack (show (projectIdx + 1)),
-              projectSummary =
-                "Quarterly delivery stream focusing on "
-                  <> Text.toLower deptName
-                  <> " outcomes and platform readiness.",
-              projectLeadId = leadId,
-              projectTeamIds = teamIds,
-              projectBudget = 450000 + fromIntegral (length teamIds) * 52500,
-              projectStatus = statusValue,
-              projectTags =
-                ["modernization", Text.toLower deptName, "2025 roadmap"],
-              projectMilestones =
-                [ "Design sign-off (" <> quarterLabel projectIdx <> ")",
-                  "Pilot deployment (" <> quarterLabel (projectIdx + 1) <> ")",
-                  "General availability (" <> quarterLabel (projectIdx + 2) <> ")"
-                ]
-            }
+           in Project
+                { projectCode = deptCode <> Text.pack (show (100 + projectIdx)),
+                  projectName = deptName <> " Initiative " <> Text.pack (show (projectIdx + 1)),
+                  projectSummary =
+                    "Quarterly delivery stream focusing on "
+                      <> Text.toLower deptName
+                      <> " outcomes and platform readiness.",
+                  projectLeadId = leadId,
+                  projectTeamIds = teamIds,
+                  projectBudget = 450000 + fromIntegral (length teamIds) * 52500,
+                  projectStatus = statusValue,
+                  projectTags =
+                    ["modernization", Text.toLower deptName, "2025 roadmap"],
+                  projectMilestones =
+                    [ "Design sign-off (" <> quarterLabel projectIdx <> ")",
+                      "Pilot deployment (" <> quarterLabel (projectIdx + 1) <> ")",
+                      "General availability (" <> quarterLabel (projectIdx + 2) <> ")"
+                    ]
+                }
 
         deptCode = Text.concat (map (Text.take 1) (Text.words deptName))
 
@@ -430,7 +429,7 @@ enterpriseSnapshot =
       let (h, t) = splitAt size xs
        in if null h then [] else h : chunk size t
 
-    showDigit idx = Text.singleton (Char.intToDigit (((idx `mod` 9) + 1)))
+    showDigit idx = Text.singleton (Char.intToDigit ((idx `mod` 9) + 1))
 
     builtDepartments = map buildDepartment departmentsConfig
     departments = [dept | (_, _, dept) <- builtDepartments]

@@ -9,6 +9,7 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+
 {-# HLINT ignore "Eta reduce" #-}
 {-# HLINT ignore "Redundant return" #-}
 
@@ -126,20 +127,26 @@
 -- * The library is most effective with data containing repeated structures
 module Serializotron where
 
+import Codec.Compression.GZip qualified as GZip
+import Control.Applicative ((<|>))
 import Control.Exception (IOException, try)
 import Control.Lens
-import Control.Applicative ((<|>))
-import Control.Monad (zipWithM, unless, when)
+import Control.Monad (unless, when, zipWithM)
 import Control.Monad.State.Strict
 import Crypto.Hash (Blake2b_256, Digest)
 import Crypto.Hash qualified as Crypto
-import Data.Hashable (Hashable (..), hashWithSalt)
+import Data.Aeson (ToJSON (..), object)
+import Data.Aeson qualified as Aeson
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Builder qualified as Builder
+import Data.ByteString.Lazy qualified as BSL
 import Data.ByteString.Lazy qualified as LBS
 import Data.Char (chr, ord)
+import Data.Dynamic (Dynamic, fromDynamic, toDyn)
+import Data.Hashable (Hashable (..), hashWithSalt)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List (elemIndex)
 import Data.Map.Lazy qualified as Map.Lazy
@@ -150,25 +157,18 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
-import Data.Typeable (Proxy (..), TyCon, TypeRep, Typeable, tyConModule, tyConName, typeRep, typeRepArgs, typeRepTyCon)
-import Data.Word (Word16, Word32, Word64, Word8)
-import GHC.Generics
-import Lens.Family2 qualified as Lens
-import Codec.Compression.GZip qualified as GZip
-import System.IO.Unsafe (unsafePerformIO)
-import System.IO (stderr, hPutStrLn)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, writeIORef, readIORef)
-import Data.Dynamic (Dynamic, fromDynamic, toDyn)
-import Data.Aeson (ToJSON (..), object)
-import Data.Aeson qualified as Aeson
-import Data.ByteString.Lazy qualified as BSL
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TLE
-import System.Environment (lookupEnv)
+import Data.Typeable (Proxy (..), TyCon, TypeRep, Typeable, tyConModule, tyConName, typeRep, typeRepArgs, typeRepTyCon)
+import Data.Word (Word16, Word32, Word64, Word8)
 import Debug.Trace (trace)
-
+import GHC.Generics
+import Lens.Family2 qualified as Lens
 import Proto.Serializotron qualified as Proto
 import Proto.Serializotron_Fields qualified as Proto
+import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
+import System.IO.Unsafe (unsafePerformIO)
 
 --------------------------------------------------------------------------------
 -- File Format Header
@@ -176,8 +176,10 @@ import Proto.Serializotron_Fields qualified as Proto
 
 -- | Compression method used in SZT file
 data CompressionMethod
-  = NoCompression      -- ^ Raw protobuf, no compression
-  | GZipCompression    -- ^ GZip compression (good balance, ubiquitous)
+  = -- | Raw protobuf, no compression
+    NoCompression
+  | -- | GZip compression (good balance, ubiquitous)
+    GZipCompression
   deriving stock (Show, Eq, Enum, Bounded)
 
 -- | Convert compression method to byte representation
@@ -193,10 +195,10 @@ compressionFromByte _ = Nothing
 
 -- | SZT file header structure (8 bytes total)
 data SZTHeader = SZTHeader
-  { _headerMagic :: ByteString       -- 4 bytes: "SZT\0"
-  , _headerVersion :: Word8          -- 1 byte: format version
-  , _headerCompression :: CompressionMethod  -- 1 byte: compression type
-  , _headerReserved :: Word16        -- 2 bytes: reserved for future use
+  { _headerMagic :: ByteString, -- 4 bytes: "SZT\0"
+    _headerVersion :: Word8, -- 1 byte: format version
+    _headerCompression :: CompressionMethod, -- 1 byte: compression type
+    _headerReserved :: Word16 -- 2 bytes: reserved for future use
   }
   deriving stock (Show, Eq)
 
@@ -210,21 +212,22 @@ headerFormatVersion = 1
 
 -- | Create a header with specified compression
 mkHeader :: CompressionMethod -> SZTHeader
-mkHeader compression = SZTHeader
-  { _headerMagic = sztMagicBytes
-  , _headerVersion = headerFormatVersion
-  , _headerCompression = compression
-  , _headerReserved = 0
-  }
+mkHeader compression =
+  SZTHeader
+    { _headerMagic = sztMagicBytes,
+      _headerVersion = headerFormatVersion,
+      _headerCompression = compression,
+      _headerReserved = 0
+    }
 
 -- | Serialize header to bytes (8 bytes total)
 encodeHeader :: SZTHeader -> ByteString
 encodeHeader (SZTHeader magic version compression reserved) =
   ByteString.concat
-    [ magic                                    -- 4 bytes
-    , ByteString.singleton version            -- 1 byte
-    , ByteString.singleton (compressionToByte compression)  -- 1 byte
-    , ByteString.pack [fromIntegral (reserved `div` 256), fromIntegral (reserved `mod` 256)]  -- 2 bytes
+    [ magic, -- 4 bytes
+      ByteString.singleton version, -- 1 byte
+      ByteString.singleton (compressionToByte compression), -- 1 byte
+      ByteString.pack [fromIntegral (reserved `div` 256), fromIntegral (reserved `mod` 256)] -- 2 bytes
     ]
 
 -- | Parse header from bytes
@@ -234,11 +237,13 @@ decodeHeader bs
   | otherwise = do
       let magic = ByteString.take 4 bs
       unless (magic == sztMagicBytes) $
-        Left $ "Invalid magic bytes: expected SZT\\0, got " <> Text.pack (show magic)
+        Left $
+          "Invalid magic bytes: expected SZT\\0, got " <> Text.pack (show magic)
 
       let version = ByteString.index bs 4
       unless (version == headerFormatVersion) $
-        Left $ "Unsupported format version: " <> Text.pack (show version)
+        Left $
+          "Unsupported format version: " <> Text.pack (show version)
 
       let compressionByte = ByteString.index bs 5
       compression <- case compressionFromByte compressionByte of
@@ -313,8 +318,8 @@ data TypeStructure
 
 -- | Named field metadata for product types
 data FieldInfo = FieldInfo
-  { _fiFieldName :: Maybe Text
-  , _fiFieldType :: TypeInfo
+  { _fiFieldName :: Maybe Text,
+    _fiFieldType :: TypeInfo
   }
   deriving stock (Generic, Show, Eq, Ord)
 
@@ -340,25 +345,19 @@ data FieldInfo = FieldInfo
 -- @
 data TypeInfo = TypeInfo
   { -- | Type name: "Person", "Maybe", "[]"
-    _tiTypeName :: Maybe Text
-
+    _tiTypeName :: Maybe Text,
     -- | Module where type is defined: "MyModule", "GHC.Types"
-  , _tiModule :: Maybe Text
-
+    _tiModule :: Maybe Text,
     -- | Constructor names: ["Person"], ["Nothing", "Just"]
-  , _tiConstructors :: [Text]
-
+    _tiConstructors :: [Text],
     -- | Record field labels in declaration order
-  , _tiFieldLabels :: [Text]
-
+    _tiFieldLabels :: [Text],
     -- | Detailed structural information
-  , _tiStructure :: Maybe TypeStructure
-
+    _tiStructure :: Maybe TypeStructure,
     -- | Type parameters (e.g., for "Model t v" applied to concrete types like "Model CartesianTupleSystem Arithmetic")
-  , _tiTypeParameters :: [TypeInfo]
-
+    _tiTypeParameters :: [TypeInfo],
     -- | For newtypes: TypeInfo of the wrapped type
-  , _tiNewtypeWrapper :: Maybe TypeInfo
+    _tiNewtypeWrapper :: Maybe TypeInfo
   }
   deriving stock (Generic, Show, Eq, Ord)
 
@@ -390,24 +389,24 @@ eitherTyCon = typeRepTyCon (typeRep (Proxy @(Either Int Int)))
 
 listElementType :: TypeRep -> Maybe TypeRep
 listElementType rep
-  | typeRepTyCon rep == listTyCon
-  , [elemRep] <- typeRepArgs rep
-  = Just elemRep
-  | otherwise
-  = Nothing
+  | typeRepTyCon rep == listTyCon,
+    [elemRep] <- typeRepArgs rep =
+      Just elemRep
+  | otherwise =
+      Nothing
 
 maybeElementType :: TypeRep -> Maybe TypeRep
 maybeElementType rep
-  | typeRepTyCon rep == maybeTyCon
-  , [elemRep] <- typeRepArgs rep
-  = Just elemRep
+  | typeRepTyCon rep == maybeTyCon,
+    [elemRep] <- typeRepArgs rep =
+      Just elemRep
   | otherwise = Nothing
 
 eitherElementTypes :: TypeRep -> Maybe (TypeRep, TypeRep)
 eitherElementTypes rep
-  | typeRepTyCon rep == eitherTyCon
-  , [leftRep, rightRep] <- typeRepArgs rep
-  = Just (leftRep, rightRep)
+  | typeRepTyCon rep == eitherTyCon,
+    [leftRep, rightRep] <- typeRepArgs rep =
+      Just (leftRep, rightRep)
   | otherwise = Nothing
 
 typeInfoForRep :: TypeRep -> TypeInfo
@@ -418,11 +417,11 @@ typeInfoForRep rep =
       -- Extract type parameters recursively
       typeParams = map typeInfoForRep (typeRepArgs rep)
    in emptyTypeInfo
-        { _tiTypeName = Just nameText
-        , _tiModule = Just moduleText
-        , _tiStructure = structureForTypeRep rep
-        , _tiTypeParameters = typeParams
-        , _tiNewtypeWrapper = Nothing  -- Explicit for clarity
+        { _tiTypeName = Just nameText,
+          _tiModule = Just moduleText,
+          _tiStructure = structureForTypeRep rep,
+          _tiTypeParameters = typeParams,
+          _tiNewtypeWrapper = Nothing -- Explicit for clarity
         }
 
 structureForTypeRep :: TypeRep -> Maybe TypeStructure
@@ -447,18 +446,17 @@ structureForTypeRep rep
        in Just (TSSum [leftInfo, rightInfo])
   | otherwise = Nothing
 
-
 -- | Primitive value types
 data PrimitiveValue
-  = PInt      Int
-  | PDouble   Double
-  | PText     Text
-  | PBool     Bool
-  | PWord64   Word64
-  | PInt32    Int32
-  | PWord32   Word32
-  | PInteger  Text -- Arbitrary precision stored as text
-  | PBytes    ByteString
+  = PInt Int
+  | PDouble Double
+  | PText Text
+  | PBool Bool
+  | PWord64 Word64
+  | PInt32 Int32
+  | PWord32 Word32
+  | PInteger Text -- Arbitrary precision stored as text
+  | PBytes ByteString
   deriving stock (Generic, Show, Eq)
 
 -- | Core value representation for all Haskell data structures.
@@ -484,30 +482,24 @@ data PrimitiveValue
 data DynamicCore
   = -- | Basic values: Int, Text, Bool, etc.
     DPrimitive PrimitiveValue
-
   | -- | Records and tuples: data Foo = Foo A B
     DProduct [DynamicValue]
-
   | -- | Tagged unions: data Foo = A | B Int (constructor index + value)
     DSum Word32 DynamicValue
-
   | -- | Homogeneous lists: [a]
     DList [DynamicValue]
-
   | -- | Unit type and empty constructors: () or EmptyConstructor
     DUnit
-
   | -- | Reference to shared value for deduplication
     DReference Word32
-
   deriving stock (Generic, Show, Eq)
 
 -- | Core dynamic value with optional type metadata
 data DynamicValue = DynamicValue
-  { _dvCore          :: DynamicCore
-  , _dvTypeInfo      :: Maybe TypeInfo
-  , _dvSchemaVersion :: SchemaVersion
-  , _dvShallowId     :: Maybe ByteString  -- Optional shallow identifier for fast deduplication
+  { _dvCore :: DynamicCore,
+    _dvTypeInfo :: Maybe TypeInfo,
+    _dvSchemaVersion :: SchemaVersion,
+    _dvShallowId :: Maybe ByteString -- Optional shallow identifier for fast deduplication
   }
   deriving stock (Generic, Show, Eq)
 
@@ -515,9 +507,9 @@ makeLenses ''DynamicValue
 
 -- | Top-level SZT file structure
 data SZTFile = SZTFile
-  { _sztSchemaVersion :: SchemaVersion
-  , _sztValue         :: DynamicValue
-  , _sztSharedValues  :: Map.Map Word32 DynamicValue -- Deduplication table
+  { _sztSchemaVersion :: SchemaVersion,
+    _sztValue :: DynamicValue,
+    _sztSharedValues :: Map.Map Word32 DynamicValue -- Deduplication table
   }
   deriving stock (Generic, Show, Eq)
 
@@ -553,13 +545,11 @@ makeLenses ''SZTFile
 -- @
 data DeduplicationStrategy = DeduplicationStrategy
   { -- | Only dedupe values with estimated size >= this (bytes)
-    _minSizeThreshold :: Int
-
+    _minSizeThreshold :: Int,
     -- | Maximum recursion depth for deduplication scanning
-  , _maxDepthScan :: Int
-
+    _maxDepthScan :: Int,
     -- | Master switch for deduplication (disable for fastest serialization)
-  , _enableDeduplication :: Bool
+    _enableDeduplication :: Bool
   }
   deriving stock (Show, Eq)
 
@@ -573,19 +563,15 @@ makeLenses ''DeduplicationStrategy
 -- - Which types are the best candidates for ShallowIdentifiable optimization
 data DeduplicationStats = DeduplicationStats
   { -- | Total number of times each type was encountered during serialization
-    _typeEncounters :: Map.Map String Int
-
+    _typeEncounters :: Map.Map String Int,
     -- | Number of times each type was successfully deduplicated (reused via reference)
-  , _typeDeduplicated :: Map.Map String Int
-
+    _typeDeduplicated :: Map.Map String Int,
     -- | Number of times each type had to be fully hashed (expensive operation)
-  , _typeHashed :: Map.Map String Int
-
+    _typeHashed :: Map.Map String Int,
     -- | Number of times each type was skipped (too small or too deep)
-  , _typeSkipped :: Map.Map String Int
-
+    _typeSkipped :: Map.Map String Int,
     -- | Total bytes saved by deduplication per type (approximate)
-  , _typeBytesSaved :: Map.Map String Int
+    _typeBytesSaved :: Map.Map String Int
   }
   deriving stock (Show, Eq)
 
@@ -593,35 +579,38 @@ makeLenses ''DeduplicationStats
 
 -- | Create an empty stats structure
 emptyDeduplicationStats :: DeduplicationStats
-emptyDeduplicationStats = DeduplicationStats
-  { _typeEncounters = Map.empty
-  , _typeDeduplicated = Map.empty
-  , _typeHashed = Map.empty
-  , _typeSkipped = Map.empty
-  , _typeBytesSaved = Map.empty
-  }
+emptyDeduplicationStats =
+  DeduplicationStats
+    { _typeEncounters = Map.empty,
+      _typeDeduplicated = Map.empty,
+      _typeHashed = Map.empty,
+      _typeSkipped = Map.empty,
+      _typeBytesSaved = Map.empty
+    }
 
 -- | Event logged during deduplication for performance analysis
 data DeduplicationEvent = DeduplicationEvent
-  { _evTypeName :: Text
-  , _evHasShallowId :: Bool
-  , _evHashPreview :: Text  -- First 8 characters of shallow/fast hash
-  , _evFullHashPreview :: Text  -- First 8 characters of full Hashable hash
-  , _evShallowIdPreview :: Maybe Text  -- First 16 hex chars of shallow ID
-  , _evWasDeduplicated :: Bool
-  , _evEstimatedSize :: Int
-  } deriving stock (Show, Eq, Generic)
+  { _evTypeName :: Text,
+    _evHasShallowId :: Bool,
+    _evHashPreview :: Text, -- First 8 characters of shallow/fast hash
+    _evFullHashPreview :: Text, -- First 8 characters of full Hashable hash
+    _evShallowIdPreview :: Maybe Text, -- First 16 hex chars of shallow ID
+    _evWasDeduplicated :: Bool,
+    _evEstimatedSize :: Int
+  }
+  deriving stock (Show, Eq, Generic)
 
 instance ToJSON DeduplicationEvent where
-  toJSON ev = object
-    [ "type" Aeson..= _evTypeName ev
-    , "has_shallow_id" Aeson..= _evHasShallowId ev
-    , "hash_preview" Aeson..= _evHashPreview ev
-    , "full_hash_preview" Aeson..= _evFullHashPreview ev
-    , "shallow_id_preview" Aeson..= _evShallowIdPreview ev
-    , "was_deduplicated" Aeson..= _evWasDeduplicated ev
-    , "estimated_size" Aeson..= _evEstimatedSize ev
-    ]
+  toJSON ev =
+    object
+      [ "type" Aeson..= _evTypeName ev,
+        "has_shallow_id" Aeson..= _evHasShallowId ev,
+        "hash_preview" Aeson..= _evHashPreview ev,
+        "full_hash_preview" Aeson..= _evFullHashPreview ev,
+        "shallow_id_preview" Aeson..= _evShallowIdPreview ev,
+        "was_deduplicated" Aeson..= _evWasDeduplicated ev,
+        "estimated_size" Aeson..= _evEstimatedSize ev
+      ]
 
 -- | Check if instrumentation is enabled via environment variable
 {-# NOINLINE instrumentationEnabled #-}
@@ -638,26 +627,27 @@ bytesToHexPreview bs = Text.pack $ take 16 $ concatMap toHex $ ByteString.unpack
       let high = byte `div` 16
           low = byte `mod` 16
           hexChar n = if n < 10 then chr (ord '0' + fromIntegral n) else chr (ord 'a' + fromIntegral (n - 10))
-      in [hexChar high, hexChar low]
+       in [hexChar high, hexChar low]
 
 -- | Emit a JSON instrumentation event using Debug.Trace
 -- This emits to stderr and works in pure code
 emitEvent :: Text -> Bool -> Text -> Text -> Maybe ByteString -> Bool -> Int -> ()
 emitEvent typeName hasShallowId hashPreview fullHashPreview shallowIdBytes wasDeduplicated estimatedSize =
   if instrumentationEnabled
-  then
-    let ev = DeduplicationEvent
-          { _evTypeName = typeName
-          , _evHasShallowId = hasShallowId
-          , _evHashPreview = hashPreview
-          , _evFullHashPreview = fullHashPreview
-          , _evShallowIdPreview = fmap bytesToHexPreview shallowIdBytes
-          , _evWasDeduplicated = wasDeduplicated
-          , _evEstimatedSize = estimatedSize
-          }
-        jsonStr = TL.unpack $ TLE.decodeUtf8 $ Aeson.encode ev
-    in trace jsonStr ()
-  else ()
+    then
+      let ev =
+            DeduplicationEvent
+              { _evTypeName = typeName,
+                _evHasShallowId = hasShallowId,
+                _evHashPreview = hashPreview,
+                _evFullHashPreview = fullHashPreview,
+                _evShallowIdPreview = fmap bytesToHexPreview shallowIdBytes,
+                _evWasDeduplicated = wasDeduplicated,
+                _evEstimatedSize = estimatedSize
+              }
+          jsonStr = TL.unpack $ TLE.decodeUtf8 $ Aeson.encode ev
+       in trace jsonStr ()
+    else ()
 
 -- | Default deduplication strategy - conservative settings.
 --
@@ -677,9 +667,9 @@ emitEvent typeName hasShallowId hashPreview fullHashPreview shallowIdBytes wasDe
 defaultDeduplicationStrategy :: DeduplicationStrategy
 defaultDeduplicationStrategy =
   DeduplicationStrategy
-    { _minSizeThreshold    = 20 -- Skip small values (< 20 bytes estimated)
-    , _maxDepthScan        = 10 -- Don't recurse too deep
-    , _enableDeduplication = True
+    { _minSizeThreshold = 20, -- Skip small values (< 20 bytes estimated)
+      _maxDepthScan = 10, -- Don't recurse too deep
+      _enableDeduplication = True
     }
 
 -- | Aggressive deduplication - deduplicate everything possible.
@@ -703,9 +693,9 @@ defaultDeduplicationStrategy =
 aggressiveDeduplicationStrategy :: DeduplicationStrategy
 aggressiveDeduplicationStrategy =
   DeduplicationStrategy
-    { _minSizeThreshold    = 1   -- Deduplicate even tiny values
-    , _maxDepthScan        = 100 -- Deep scanning
-    , _enableDeduplication = True
+    { _minSizeThreshold = 1, -- Deduplicate even tiny values
+      _maxDepthScan = 100, -- Deep scanning
+      _enableDeduplication = True
     }
 
 -- | Disable deduplication entirely.
@@ -728,9 +718,9 @@ aggressiveDeduplicationStrategy =
 noDeduplicationStrategy :: DeduplicationStrategy
 noDeduplicationStrategy =
   DeduplicationStrategy
-    { _minSizeThreshold    = maxBound
-    , _maxDepthScan        = 0
-    , _enableDeduplication = False
+    { _minSizeThreshold = maxBound,
+      _maxDepthScan = 0,
+      _enableDeduplication = False
     }
 
 -- | Did our hash calculation use pure content values
@@ -740,14 +730,14 @@ data HashScope = PureContent | WithReference
 
 -- | 'WithReference' taints any other value.
 instance Semigroup HashScope where
-  WithReference <> _             = WithReference
-  _             <> WithReference = WithReference
-  PureContent   <> PureContent   = PureContent
+  WithReference <> _ = WithReference
+  _ <> WithReference = WithReference
+  PureContent <> PureContent = PureContent
 
 data Scoped a = Scoped HashScope a
   deriving stock (Eq)
 
-instance Show a => Show (Scoped a) where
+instance (Show a) => Show (Scoped a) where
   show (Scoped s x) = show s <> ":" <> show x
 
 instance Functor Scoped where
@@ -756,9 +746,9 @@ instance Functor Scoped where
 instance Applicative Scoped where
   pure = Scoped PureContent
 
-  Scoped PureContent   f <*> Scoped PureContent   x = Scoped PureContent   (f x)
-  Scoped PureContent   f <*> Scoped WithReference x = Scoped WithReference (f x)
-  Scoped WithReference f <*> Scoped _             x = Scoped WithReference (f x)
+  Scoped PureContent f <*> Scoped PureContent x = Scoped PureContent (f x)
+  Scoped PureContent f <*> Scoped WithReference x = Scoped WithReference (f x)
+  Scoped WithReference f <*> Scoped _ x = Scoped WithReference (f x)
 
 instance Monad Scoped where
   Scoped PureContent x >>= f = f x
@@ -777,11 +767,11 @@ type ContentHash = Digest Blake2b_256
 
 -- | State for deduplication process
 data DeduplicationState = DeduplicationState
-  { _nextReferenceId  :: Word32
-  , _seenHashes       :: Map.Map ContentHash (Either DynamicValue Word32)  -- Left = first occurrence, Right = ref ID
-  , _sharedTable      :: Map.Map Word32 DynamicValue
-  , _currentDepth     :: Int
-  , _strategy         :: DeduplicationStrategy
+  { _nextReferenceId :: Word32,
+    _seenHashes :: Map.Map ContentHash (Either DynamicValue Word32), -- Left = first occurrence, Right = ref ID
+    _sharedTable :: Map.Map Word32 DynamicValue,
+    _currentDepth :: Int,
+    _strategy :: DeduplicationStrategy
   }
   deriving stock (Show)
 
@@ -794,11 +784,11 @@ type DeduplicationM = State DeduplicationState
 initDeduplicationState :: DeduplicationStrategy -> DeduplicationState
 initDeduplicationState strat =
   DeduplicationState
-    { _nextReferenceId  = 1 -- Start from 1, perhaps we will reserve 0 for something.
-    , _seenHashes       = Map.empty
-    , _sharedTable      = Map.empty
-    , _currentDepth     = 0
-    , _strategy         = strat
+    { _nextReferenceId = 1, -- Start from 1, perhaps we will reserve 0 for something.
+      _seenHashes = Map.empty,
+      _sharedTable = Map.empty,
+      _currentDepth = 0,
+      _strategy = strat
     }
 
 -- | Estimate the size of a DynamicValue using SHALLOW inspection only.
@@ -809,23 +799,22 @@ estimateSize (DynamicValue core _typeInfo _dvSchemaVersion _shallowId) = coreSiz
   where
     typeInfoSize = 50 -- Rough estimate for type info
     estimatedChildSize = 50 -- Rough estimate per child
-
     coreSize = case core of
-      DPrimitive (PInt      _)  -> 8
-      DPrimitive (PDouble   _)  -> 8
-      DPrimitive (PBool     _)  -> 1
-      DPrimitive (PText     t)  -> Text.length t * 2 -- Rough UTF-8 estimate
-      DPrimitive (PWord64   _)  -> 8
-      DPrimitive (PInt32    _)  -> 4
-      DPrimitive (PWord32   _)  -> 4
-      DPrimitive (PInteger  t)  -> Text.length t * 2 -- Text representation
-      DPrimitive (PBytes    bs) -> ByteString.length bs -- Byte length
+      DPrimitive (PInt _) -> 8
+      DPrimitive (PDouble _) -> 8
+      DPrimitive (PBool _) -> 1
+      DPrimitive (PText t) -> Text.length t * 2 -- Rough UTF-8 estimate
+      DPrimitive (PWord64 _) -> 8
+      DPrimitive (PInt32 _) -> 4
+      DPrimitive (PWord32 _) -> 4
+      DPrimitive (PInteger t) -> Text.length t * 2 -- Text representation
+      DPrimitive (PBytes bs) -> ByteString.length bs -- Byte length
       -- SHALLOW estimates - just count immediate children, don't recurse
-      DProduct    vals          -> 10 + length vals * estimatedChildSize
-      DSum      _ _             -> 10 + estimatedChildSize
-      DList       vals          -> 10 + length vals * estimatedChildSize
-      DUnit                     -> 1
-      DReference _              -> 4
+      DProduct vals -> 10 + length vals * estimatedChildSize
+      DSum _ _ -> 10 + estimatedChildSize
+      DList vals -> 10 + length vals * estimatedChildSize
+      DUnit -> 1
+      DReference _ -> 4
 
 -- | Compute content hash of a DynamicValue.
 computeContentHash :: DynamicValue -> Scoped ContentHash
@@ -851,26 +840,24 @@ computeContentHash dynValue = Crypto.hash . LBS.toStrict . Builder.toLazyByteStr
 
     primitiveHashBytes :: PrimitiveValue -> Builder.Builder
     primitiveHashBytes = \case
-      PInt i       -> Builder.word8 0x10 <> Builder.intDec i
-      PDouble d    -> Builder.word8 0x11 <> Builder.doubleDec d
-      PText t      -> Builder.word8 0x12 <> Builder.byteString (encodeUtf8 t)
-      PBool b      -> Builder.word8 0x13 <> Builder.word8 (if b then 1 else 0)
-      PWord64 w    -> Builder.word8 0x14 <> Builder.word64BE w
-      PInt32 i     -> Builder.word8 0x15 <> Builder.int32BE i
-      PWord32 w    -> Builder.word8 0x16 <> Builder.word32BE w
-      PInteger t   -> Builder.word8 0x17 <> Builder.byteString (encodeUtf8 t)
-      PBytes bs    -> Builder.word8 0x18 <> Builder.word32BE (fromIntegral $ ByteString.length bs) <> Builder.byteString bs
+      PInt i -> Builder.word8 0x10 <> Builder.intDec i
+      PDouble d -> Builder.word8 0x11 <> Builder.doubleDec d
+      PText t -> Builder.word8 0x12 <> Builder.byteString (encodeUtf8 t)
+      PBool b -> Builder.word8 0x13 <> Builder.word8 (if b then 1 else 0)
+      PWord64 w -> Builder.word8 0x14 <> Builder.word64BE w
+      PInt32 i -> Builder.word8 0x15 <> Builder.int32BE i
+      PWord32 w -> Builder.word8 0x16 <> Builder.word32BE w
+      PInteger t -> Builder.word8 0x17 <> Builder.byteString (encodeUtf8 t)
+      PBytes bs -> Builder.word8 0x18 <> Builder.word32BE (fromIntegral $ ByteString.length bs) <> Builder.byteString bs
 
 -- | Apply deduplication to a DynamicValue
 deduplicateValue :: DeduplicationStrategy -> DynamicValue -> (DynamicValue, Map.Map Word32 DynamicValue)
 deduplicateValue strat rootValue
-  | _enableDeduplication strat
-  = let (result, finalState) = runState (deduplicateValue' rootValue) (initDeduplicationState strat)
-      in (result, _sharedTable finalState)
-
-  | otherwise
-  = (rootValue, Map.empty)
-
+  | _enableDeduplication strat =
+      let (result, finalState) = runState (deduplicateValue' rootValue) (initDeduplicationState strat)
+       in (result, _sharedTable finalState)
+  | otherwise =
+      (rootValue, Map.empty)
   where
     deduplicateValue' :: DynamicValue -> DeduplicationM DynamicValue
     deduplicateValue' dynVal = do
@@ -929,12 +916,12 @@ deduplicateValue strat rootValue
 
     deduplicateCore :: DynamicCore -> DeduplicationM DynamicCore
     deduplicateCore = \case
-      DPrimitive pv     -> return $ DPrimitive pv
-      DProduct   vals   -> DProduct <$> mapM deduplicateValue' vals
-      DSum     i val    -> DSum i   <$> deduplicateValue' val
-      DList      vals   -> DList    <$> mapM deduplicateValue' vals
-      DUnit             -> return DUnit
-      DReference  refId -> return $ DReference refId
+      DPrimitive pv -> return $ DPrimitive pv
+      DProduct vals -> DProduct <$> mapM deduplicateValue' vals
+      DSum i val -> DSum i <$> deduplicateValue' val
+      DList vals -> DList <$> mapM deduplicateValue' vals
+      DUnit -> return DUnit
+      DReference refId -> return $ DReference refId
 
 --------------------------------------------------------------------------------
 -- Fast Deduplication (Hashable-based)
@@ -953,18 +940,20 @@ type HashableHash = Int
 -- future occurrences (since the shared-table copy has already had its
 -- children deduplicated and therefore differs structurally).
 data SeenEntry
-  = FirstSeen  DynamicValue           -- ^ Original value (first encounter)
-  | Promoted   Word32 DynamicValue    -- ^ (refId, original) — promoted to shared table
+  = -- | Original value (first encounter)
+    FirstSeen DynamicValue
+  | -- | (refId, original) — promoted to shared table
+    Promoted Word32 DynamicValue
   deriving stock (Show)
 
 -- | State for fast deduplication using Hashable
 data FastDeduplicationState = FastDeduplicationState
-  { _fastNextReferenceId  :: Word32
-  , _fastSeenHashes       :: Map.Map HashableHash SeenEntry
-  , _fastSharedTable      :: Map.Map Word32 DynamicValue
-  , _fastCurrentDepth     :: Int
-  , _fastStrategy         :: DeduplicationStrategy
-  , _fastStats            :: DeduplicationStats  -- Statistics tracking
+  { _fastNextReferenceId :: Word32,
+    _fastSeenHashes :: Map.Map HashableHash SeenEntry,
+    _fastSharedTable :: Map.Map Word32 DynamicValue,
+    _fastCurrentDepth :: Int,
+    _fastStrategy :: DeduplicationStrategy,
+    _fastStats :: DeduplicationStats -- Statistics tracking
   }
   deriving stock (Show)
 
@@ -977,12 +966,12 @@ type FastDeduplicationM = State FastDeduplicationState
 initFastDeduplicationState :: DeduplicationStrategy -> FastDeduplicationState
 initFastDeduplicationState strat =
   FastDeduplicationState
-    { _fastNextReferenceId  = 1
-    , _fastSeenHashes       = Map.empty
-    , _fastSharedTable      = Map.empty
-    , _fastCurrentDepth     = 0
-    , _fastStrategy         = strat
-    , _fastStats            = emptyDeduplicationStats
+    { _fastNextReferenceId = 1,
+      _fastSeenHashes = Map.empty,
+      _fastSharedTable = Map.empty,
+      _fastCurrentDepth = 0,
+      _fastStrategy = strat,
+      _fastStats = emptyDeduplicationStats
     }
 
 -- | Compute fast hash of a DynamicValue using Hashable typeclass.
@@ -1006,23 +995,19 @@ computeFastApproximateHash (DynamicValue core typeInfo _ _) =
     approximateHashCore = \case
       -- Primitives are cheap - hash fully
       DPrimitive pv -> hashWithSalt 0 (0 :: Int, pv)
-
       -- ALL products - sample SIZES only (truly O(1)!)
       DProduct vals ->
         let len = length vals
             sizes = map estimateSize (take 3 vals)
-        in hashWithSalt 0 (1 :: Int, len, sizes)
-
+         in hashWithSalt 0 (1 :: Int, len, sizes)
       -- Sums - hash constructor index + SIZE of child (not full content!)
       DSum index val ->
         hashWithSalt 0 (2 :: Int, index, estimateSize val)
-
       -- ALL lists - sample SIZES only (truly O(1)!)
       DList vals ->
         let len = length vals
             sizes = map estimateSize (take 3 vals)
-        in hashWithSalt 0 (3 :: Int, len, sizes)
-
+         in hashWithSalt 0 (3 :: Int, len, sizes)
       -- Unit and Reference are cheap
       DUnit -> hashWithSalt 0 (4 :: Int)
       DReference refId -> hashWithSalt 0 (5 :: Int, refId)
@@ -1030,41 +1015,42 @@ computeFastApproximateHash (DynamicValue core typeInfo _ _) =
 -- Make DynamicCore hashable for fast deduplication
 instance Hashable DynamicCore where
   hashWithSalt salt = \case
-    DPrimitive pv     -> salt `hashWithSalt` (0 :: Int) `hashWithSalt` pv
-    DProduct vals     -> salt `hashWithSalt` (1 :: Int) `hashWithSalt` vals
-    DSum index val    -> salt `hashWithSalt` (2 :: Int) `hashWithSalt` index `hashWithSalt` val
-    DList vals        -> salt `hashWithSalt` (3 :: Int) `hashWithSalt` vals
-    DUnit             -> salt `hashWithSalt` (4 :: Int)
-    DReference refId  -> salt `hashWithSalt` (5 :: Int) `hashWithSalt` refId
+    DPrimitive pv -> salt `hashWithSalt` (0 :: Int) `hashWithSalt` pv
+    DProduct vals -> salt `hashWithSalt` (1 :: Int) `hashWithSalt` vals
+    DSum index val -> salt `hashWithSalt` (2 :: Int) `hashWithSalt` index `hashWithSalt` val
+    DList vals -> salt `hashWithSalt` (3 :: Int) `hashWithSalt` vals
+    DUnit -> salt `hashWithSalt` (4 :: Int)
+    DReference refId -> salt `hashWithSalt` (5 :: Int) `hashWithSalt` refId
 
 instance Hashable PrimitiveValue where
   hashWithSalt salt = \case
-    PInt i       -> salt `hashWithSalt` (0 :: Int) `hashWithSalt` i
-    PDouble d    -> salt `hashWithSalt` (1 :: Int) `hashWithSalt` d
-    PText t      -> salt `hashWithSalt` (2 :: Int) `hashWithSalt` t
-    PBool b      -> salt `hashWithSalt` (3 :: Int) `hashWithSalt` b
-    PWord64 w    -> salt `hashWithSalt` (4 :: Int) `hashWithSalt` w
-    PInt32 i     -> salt `hashWithSalt` (5 :: Int) `hashWithSalt` i
-    PWord32 w    -> salt `hashWithSalt` (6 :: Int) `hashWithSalt` w
-    PInteger t   -> salt `hashWithSalt` (7 :: Int) `hashWithSalt` t
-    PBytes bs    -> salt `hashWithSalt` (8 :: Int) `hashWithSalt` bs
+    PInt i -> salt `hashWithSalt` (0 :: Int) `hashWithSalt` i
+    PDouble d -> salt `hashWithSalt` (1 :: Int) `hashWithSalt` d
+    PText t -> salt `hashWithSalt` (2 :: Int) `hashWithSalt` t
+    PBool b -> salt `hashWithSalt` (3 :: Int) `hashWithSalt` b
+    PWord64 w -> salt `hashWithSalt` (4 :: Int) `hashWithSalt` w
+    PInt32 i -> salt `hashWithSalt` (5 :: Int) `hashWithSalt` i
+    PWord32 w -> salt `hashWithSalt` (6 :: Int) `hashWithSalt` w
+    PInteger t -> salt `hashWithSalt` (7 :: Int) `hashWithSalt` t
+    PBytes bs -> salt `hashWithSalt` (8 :: Int) `hashWithSalt` bs
 
 instance Hashable DynamicValue where
   hashWithSalt salt (DynamicValue core _typeInfo _version _shallowId) =
     salt `hashWithSalt` core
-    -- Note: We intentionally don't hash type info or shallow ID for performance
-    -- Type safety is still preserved through the type system
+
+-- Note: We intentionally don't hash type info or shallow ID for performance
+-- Type safety is still preserved through the type system
 
 -- | Apply fast deduplication to a DynamicValue using Hashable-based hashing.
 -- This is 50-100x faster than content-based deduplication but only deduplicates
 -- within a single serialization session.
 deduplicateValueFast :: DeduplicationStrategy -> DynamicValue -> (DynamicValue, Map.Map Word32 DynamicValue)
 deduplicateValueFast strat rootValue
-  | _enableDeduplication strat
-  = let (result, finalState) = runState (deduplicateValueFast' rootValue) (initFastDeduplicationState strat)
-      in (result, _fastSharedTable finalState)
-  | otherwise
-  = (rootValue, Map.empty)
+  | _enableDeduplication strat =
+      let (result, finalState) = runState (deduplicateValueFast' rootValue) (initFastDeduplicationState strat)
+       in (result, _fastSharedTable finalState)
+  | otherwise =
+      (rootValue, Map.empty)
   where
     deduplicateValueFast' :: DynamicValue -> FastDeduplicationM DynamicValue
     deduplicateValueFast' dynVal = do
@@ -1111,12 +1097,12 @@ deduplicateValueFast strat rootValue
 
     deduplicateCoreFast :: DynamicCore -> FastDeduplicationM DynamicCore
     deduplicateCoreFast = \case
-      DPrimitive pv     -> return $ DPrimitive pv
-      DProduct   vals   -> DProduct <$> mapM deduplicateValueFast' vals
-      DSum     i val    -> DSum i   <$> deduplicateValueFast' val
-      DList      vals   -> DList    <$> mapM deduplicateValueFast' vals
-      DUnit             -> return DUnit
-      DReference  refId -> return $ DReference refId
+      DPrimitive pv -> return $ DPrimitive pv
+      DProduct vals -> DProduct <$> mapM deduplicateValueFast' vals
+      DSum i val -> DSum i <$> deduplicateValueFast' val
+      DList vals -> DList <$> mapM deduplicateValueFast' vals
+      DUnit -> return DUnit
+      DReference refId -> return $ DReference refId
 
 --------------------------------------------------------------------------------
 -- Shallow Deduplication (Name-based via ShallowIdentifiable)
@@ -1154,11 +1140,11 @@ deduplicateValueShallow strat rootValue = (result, sharedTable)
 -- benefit most from ShallowIdentifiable instances.
 deduplicateValueShallowWithStats :: DeduplicationStrategy -> DynamicValue -> (DynamicValue, Map.Map Word32 DynamicValue, DeduplicationStats)
 deduplicateValueShallowWithStats strat rootValue
-  | _enableDeduplication strat
-  = let (result, finalState) = runState (deduplicateValueShallow' rootValue) (initFastDeduplicationState strat)
-      in (result, _fastSharedTable finalState, _fastStats finalState)
-  | otherwise
-  = (rootValue, Map.empty, emptyDeduplicationStats)
+  | _enableDeduplication strat =
+      let (result, finalState) = runState (deduplicateValueShallow' rootValue) (initFastDeduplicationState strat)
+       in (result, _fastSharedTable finalState, _fastStats finalState)
+  | otherwise =
+      (rootValue, Map.empty, emptyDeduplicationStats)
   where
     deduplicateValueShallow' :: DynamicValue -> FastDeduplicationM DynamicValue
     deduplicateValueShallow' dynVal = do
@@ -1180,7 +1166,7 @@ deduplicateValueShallowWithStats strat rootValue
 
           -- Skip size check if we have a shallow ID (we always want to deduplicate these)
           shouldDeduplicate <- case maybeShallowId of
-            Just _ -> return True  -- Has shallow ID - always deduplicate, skip size check
+            Just _ -> return True -- Has shallow ID - always deduplicate, skip size check
             Nothing -> do
               -- No shallow ID - check size threshold (expensive but necessary)
               let sz = estimateSize dynVal
@@ -1270,12 +1256,12 @@ deduplicateValueShallowWithStats strat rootValue
 
     deduplicateCoreShallow :: DynamicCore -> FastDeduplicationM DynamicCore
     deduplicateCoreShallow = \case
-      DPrimitive pv     -> return $ DPrimitive pv
-      DProduct   vals   -> DProduct <$> mapM deduplicateValueShallow' vals
-      DSum     i val    -> DSum i   <$> deduplicateValueShallow' val
-      DList      vals   -> DList    <$> mapM deduplicateValueShallow' vals
-      DUnit             -> return DUnit
-      DReference  refId -> return $ DReference refId
+      DPrimitive pv -> return $ DPrimitive pv
+      DProduct vals -> DProduct <$> mapM deduplicateValueShallow' vals
+      DSum i val -> DSum i <$> deduplicateValueShallow' val
+      DList vals -> DList <$> mapM deduplicateValueShallow' vals
+      DUnit -> return DUnit
+      DReference refId -> return $ DReference refId
 
 -- | Serialization type class for converting Haskell values to Serializotron format.
 --
@@ -1377,10 +1363,10 @@ class ToSZT a where
   default toSzt :: (Generic a, GToSZT (Rep a), GGetTypeInfo (Rep a), Typeable a) => a -> DynamicValue
   toSzt x =
     DynamicValue
-      { _dvCore          = gToSZT (GHC.Generics.from x)
-      , _dvTypeInfo      = Just $ gGetTypeInfo (GHC.Generics.from x) (typeRep (Proxy @a))
-      , _dvSchemaVersion = currentSchemaVersion
-      , _dvShallowId     = Nothing  -- Generics don't provide shallow IDs by default
+      { _dvCore = gToSZT (GHC.Generics.from x),
+        _dvTypeInfo = Just $ gGetTypeInfo (GHC.Generics.from x) (typeRep (Proxy @a)),
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing -- Generics don't provide shallow IDs by default
       }
 
 -- | Generic serialization type class
@@ -1408,11 +1394,11 @@ class GExtractNewtypeWrapper f where
   gExtractNewtypeWrapper :: Proxy (f p) -> Maybe TypeInfo
 
 -- For K1, extract TypeInfo using Typeable
-instance Typeable a => GExtractNewtypeWrapper (K1 i a) where
+instance (Typeable a) => GExtractNewtypeWrapper (K1 i a) where
   gExtractNewtypeWrapper _ = Just $ typeInfoForRep (typeRep (Proxy @a))
 
 -- For metadata wrappers, recurse
-instance GExtractNewtypeWrapper f => GExtractNewtypeWrapper (M1 i c f) where
+instance (GExtractNewtypeWrapper f) => GExtractNewtypeWrapper (M1 i c f) where
   gExtractNewtypeWrapper _ = gExtractNewtypeWrapper (Proxy :: Proxy (f p))
 
 -- For products and sums, we can't extract (shouldn't happen in newtypes anyway)
@@ -1428,6 +1414,7 @@ instance GExtractNewtypeWrapper U1 where
 -- | Generic type info extraction
 class GGetTypeInfo f where
   gGetTypeInfo :: f p -> TypeRep -> TypeInfo
+
   -- | Get complete type info including all constructors for sum types
   gGetCompleteTypeInfo :: f p -> TypeRep -> TypeInfo
   gGetCompleteTypeInfo = gGetTypeInfo -- Default implementation
@@ -1439,7 +1426,7 @@ class GGetFieldInfos f where
 class GGetConstructorNames f where
   gGetConstructorNames :: f p -> [Text]
 
--- | Get ALL constructor names for a sum type, regardless of active constructor  
+-- | Get ALL constructor names for a sum type, regardless of active constructor
 class GGetAllConstructorNames f where
   gGetAllConstructorNames :: Proxy (f p) -> [Text]
 
@@ -1447,7 +1434,7 @@ class GGetAllConstructorNames f where
 class GGetStructure f where
   gGetStructure :: f p -> TypeStructure
 
--- | Get complete structure for sum types, regardless of active constructor  
+-- | Get complete structure for sum types, regardless of active constructor
 class GGetCompleteStructure f where
   gGetCompleteStructure :: Proxy (f p) -> TypeStructure
 
@@ -1477,115 +1464,115 @@ instance (GToSZT f) => GToSZT (M1 i c f) where
 instance ToSZT Int where
   toSzt x =
     DynamicValue
-      { _dvCore = DPrimitive (PInt x)
-      , _dvTypeInfo =
+      { _dvCore = DPrimitive (PInt x),
+        _dvTypeInfo =
           Just $
             TypeInfo
-              { _tiTypeName = Just "Int"
-              , _tiModule = Just "GHC.Types"
-              , _tiConstructors = []
-              , _tiFieldLabels = []
-              , _tiStructure = Just (TSPrimitive PTInt)
-              , _tiTypeParameters = []
-              , _tiNewtypeWrapper = Nothing
-              }
-      , _dvSchemaVersion = currentSchemaVersion
-      , _dvShallowId = Nothing
+              { _tiTypeName = Just "Int",
+                _tiModule = Just "GHC.Types",
+                _tiConstructors = [],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSPrimitive PTInt),
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
       }
 
 instance ToSZT Double where
   toSzt x =
     DynamicValue
-      { _dvCore = DPrimitive (PDouble x)
-      , _dvTypeInfo =
+      { _dvCore = DPrimitive (PDouble x),
+        _dvTypeInfo =
           Just $
             TypeInfo
-              { _tiTypeName = Just "Double"
-              , _tiModule = Just "GHC.Types"
-              , _tiConstructors = []
-              , _tiFieldLabels = []
-              , _tiStructure = Just (TSPrimitive PTDouble)
-              , _tiTypeParameters = []
-              , _tiNewtypeWrapper = Nothing
-              }
-      , _dvSchemaVersion = currentSchemaVersion
-      , _dvShallowId = Nothing
+              { _tiTypeName = Just "Double",
+                _tiModule = Just "GHC.Types",
+                _tiConstructors = [],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSPrimitive PTDouble),
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
       }
 
 instance ToSZT Text where
   toSzt x =
     DynamicValue
-      { _dvCore = DPrimitive (PText x)
-      , _dvTypeInfo =
+      { _dvCore = DPrimitive (PText x),
+        _dvTypeInfo =
           Just $
             TypeInfo
-              { _tiTypeName = Just "Text"
-              , _tiModule = Just "Data.Text"
-              , _tiConstructors = []
-              , _tiFieldLabels = []
-              , _tiStructure = Just (TSPrimitive PTText)
-              , _tiTypeParameters = []
-              , _tiNewtypeWrapper = Nothing
-              }
-      , _dvSchemaVersion = currentSchemaVersion
-      , _dvShallowId = Nothing
+              { _tiTypeName = Just "Text",
+                _tiModule = Just "Data.Text",
+                _tiConstructors = [],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSPrimitive PTText),
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
       }
 
 instance ToSZT Bool where
   toSzt x =
     DynamicValue
-      { _dvCore = DPrimitive (PBool x)
-      , _dvTypeInfo =
+      { _dvCore = DPrimitive (PBool x),
+        _dvTypeInfo =
           Just $
             TypeInfo
-              { _tiTypeName = Just "Bool"
-              , _tiModule = Just "GHC.Types"
-              , _tiConstructors = ["False", "True"]
-              , _tiFieldLabels = []
-              , _tiStructure = Just (TSPrimitive PTBool)
-              , _tiTypeParameters = []
-              , _tiNewtypeWrapper = Nothing
-              }
-      , _dvSchemaVersion = currentSchemaVersion
-      , _dvShallowId = Nothing
+              { _tiTypeName = Just "Bool",
+                _tiModule = Just "GHC.Types",
+                _tiConstructors = ["False", "True"],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSPrimitive PTBool),
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
       }
 
 instance ToSZT ByteString where
   toSzt x =
     DynamicValue
-      { _dvCore = DPrimitive (PBytes x)
-      , _dvTypeInfo =
+      { _dvCore = DPrimitive (PBytes x),
+        _dvTypeInfo =
           Just $
             TypeInfo
-              { _tiTypeName = Just "ByteString"
-              , _tiModule = Just "Data.ByteString"
-              , _tiConstructors = []
-              , _tiFieldLabels = []
-              , _tiStructure = Just (TSPrimitive PTBytes)
-              , _tiTypeParameters = []
-              , _tiNewtypeWrapper = Nothing
-              }
-      , _dvSchemaVersion = currentSchemaVersion
-      , _dvShallowId = Nothing
+              { _tiTypeName = Just "ByteString",
+                _tiModule = Just "Data.ByteString",
+                _tiConstructors = [],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSPrimitive PTBytes),
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
       }
 
 instance (ToSZT a) => ToSZT [a] where
   toSzt xs =
     DynamicValue
-      { _dvCore = DList (map toSzt xs)
-      , _dvTypeInfo =
+      { _dvCore = DList (map toSzt xs),
+        _dvTypeInfo =
           Just $
             TypeInfo
-              { _tiTypeName = Just "[]"
-              , _tiModule = Just "GHC.Types"
-              , _tiConstructors = ["[]", ":"]
-              , _tiFieldLabels = []
-              , _tiStructure = Just (TSList elementTypeInfo)
-              , _tiTypeParameters = [elementTypeInfo]
-              , _tiNewtypeWrapper = Nothing
-              }
-      , _dvSchemaVersion = currentSchemaVersion
-      , _dvShallowId = Nothing
+              { _tiTypeName = Just "[]",
+                _tiModule = Just "GHC.Types",
+                _tiConstructors = ["[]", ":"],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSList elementTypeInfo),
+                _tiTypeParameters = [elementTypeInfo],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
       }
     where
       elementTypeInfo = case xs of
@@ -1607,17 +1594,19 @@ instance (Datatype d, GGetConstructorNames f, GGetStructure f, GGetAllConstructo
         fieldLabels = if isSumType then [] else inner ^. tiFieldLabels
         -- For single-constructor types, try to extract wrapped type
         -- This works for both newtypes and single-field data types
-        wrappedType = if length constructors == 1
-                      then gExtractNewtypeWrapper (Proxy :: Proxy (f p))
-                      else Nothing
+        wrappedType =
+          if length constructors == 1
+            then gExtractNewtypeWrapper (Proxy :: Proxy (f p))
+            else Nothing
      in inner
-          { _tiTypeName     = Just $ Text.pack (datatypeName (undefined :: M1 D d f p))
-          , _tiModule       = Just $ Text.pack (moduleName   (undefined :: M1 D d f p))
-          , _tiConstructors = constructors
-          , _tiFieldLabels  = fieldLabels
-          , _tiStructure    = fullStructure
-          , _tiNewtypeWrapper = wrappedType
+          { _tiTypeName = Just $ Text.pack (datatypeName (undefined :: M1 D d f p)),
+            _tiModule = Just $ Text.pack (moduleName (undefined :: M1 D d f p)),
+            _tiConstructors = constructors,
+            _tiFieldLabels = fieldLabels,
+            _tiStructure = fullStructure,
+            _tiNewtypeWrapper = wrappedType
           }
+
 instance (GGetTypeInfo f) => GGetTypeInfo (M1 C c f) where
   gGetTypeInfo (M1 x) = gGetTypeInfo x
 
@@ -1636,14 +1625,15 @@ instance (GGetTypeInfo f, GGetTypeInfo g, GGetFieldInfos f, GGetFieldInfos g) =>
         labeledFields = assignFieldLabels rawFields
         labels = map (fromMaybe Text.empty . (^. fiFieldName)) labeledFields
      in TypeInfo
-          { _tiTypeName = Nothing      -- No specific type name for product
-          , _tiModule = Nothing        -- No specific module for product
-          , _tiConstructors = []       -- Product combines fields, not constructors
-          , _tiFieldLabels = labels
-          , _tiStructure = Just $ TSProduct labeledFields
-          , _tiTypeParameters = []     -- Products don't have type parameters at this level
-          , _tiNewtypeWrapper = Nothing
+          { _tiTypeName = Nothing, -- No specific type name for product
+            _tiModule = Nothing, -- No specific module for product
+            _tiConstructors = [], -- Product combines fields, not constructors
+            _tiFieldLabels = labels,
+            _tiStructure = Just $ TSProduct labeledFields,
+            _tiTypeParameters = [], -- Products don't have type parameters at this level
+            _tiNewtypeWrapper = Nothing
           }
+
 instance (GGetTypeInfo f, GGetTypeInfo g) => GGetTypeInfo (f :+: g) where
   gGetTypeInfo (L1 x) tr = gGetTypeInfo x tr
   gGetTypeInfo (R1 y) tr = gGetTypeInfo y tr
@@ -1692,8 +1682,8 @@ instance (Selector s, GGetFieldInfos f) => GGetFieldInfos (M1 S s f) where
      in case fields of
           [] -> [FieldInfo name emptyTypeInfo]
           _ -> case name of
-                 Nothing -> fields
-                 Just n -> [ if isNothing (fi ^. fiFieldName) then fi & fiFieldName ?~ n else fi | fi <- fields ]
+            Nothing -> fields
+            Just n -> [if isNothing (fi ^. fiFieldName) then fi & fiFieldName ?~ n else fi | fi <- fields]
 
 instance (GGetFieldInfos f, GGetFieldInfos g) => GGetFieldInfos (f :+: g) where
   gGetFieldInfos (L1 x) = gGetFieldInfos x
@@ -1733,6 +1723,7 @@ instance (GGetStructure f) => GGetStructure (M1 S s f) where
 
 instance (GGetFieldInfos f, GGetFieldInfos g) => GGetStructure (f :*: g) where
   gGetStructure prod = TSProduct (assignFieldLabels (gGetFieldInfos prod))
+
 instance (GGetStructure f, GGetStructure g) => GGetStructure (f :+: g) where
   gGetStructure (L1 x) = gGetStructure x
   gGetStructure (R1 y) = gGetStructure y
@@ -1742,10 +1733,11 @@ instance GGetStructure U1 where
 
 -- Complete structure instances
 instance (GGetConstructorTypeInfo f, GGetConstructorTypeInfo g) => GGetCompleteStructure (f :+: g) where
-  gGetCompleteStructure _ = TSSum
-    [ gGetConstructorTypeInfo (Proxy :: Proxy (f p))
-    , gGetConstructorTypeInfo (Proxy :: Proxy (g p))
-    ]
+  gGetCompleteStructure _ =
+    TSSum
+      [ gGetConstructorTypeInfo (Proxy :: Proxy (f p)),
+        gGetConstructorTypeInfo (Proxy :: Proxy (g p))
+      ]
 
 -- For constructor level, we need to create sample values to extract structure
 -- This is complex because we can't create arbitrary values at the type level
@@ -1762,7 +1754,7 @@ instance (GGetCompleteStructure f) => GGetCompleteStructure (M1 S s f) where
 instance (GGetCompleteStructure f) => GGetCompleteStructure (M1 C c f) where
   gGetCompleteStructure _ = gGetCompleteStructure (Proxy :: Proxy (f p))
 
-instance Typeable a => GGetCompleteStructure (K1 i a) where
+instance (Typeable a) => GGetCompleteStructure (K1 i a) where
   gGetCompleteStructure _ =
     let rep = typeRep (Proxy @a)
      in fromMaybe TSUnit (structureForTypeRep rep)
@@ -1772,27 +1764,29 @@ instance GGetCompleteStructure U1 where
 
 -- Product type instance
 instance (GGetCompleteStructure f, GGetCompleteStructure g) => GGetCompleteStructure (f :*: g) where
-  gGetCompleteStructure _ = TSProduct $ assignFieldLabels
-    [ FieldInfo Nothing (emptyTypeInfo & tiStructure ?~ gGetCompleteStructure (Proxy :: Proxy (f p)))
-    , FieldInfo Nothing (emptyTypeInfo & tiStructure ?~ gGetCompleteStructure (Proxy :: Proxy (g p)))
-    ]
+  gGetCompleteStructure _ =
+    TSProduct $
+      assignFieldLabels
+        [ FieldInfo Nothing (emptyTypeInfo & tiStructure ?~ gGetCompleteStructure (Proxy :: Proxy (f p))),
+          FieldInfo Nothing (emptyTypeInfo & tiStructure ?~ gGetCompleteStructure (Proxy :: Proxy (g p)))
+        ]
 
 -- GGetConstructorTypeInfo instances
 -- These extract full TypeInfo (including type name) for constructor arguments
 
-instance Typeable a => GGetConstructorTypeInfo (K1 i a) where
+instance (Typeable a) => GGetConstructorTypeInfo (K1 i a) where
   gGetConstructorTypeInfo _ = typeInfoForRep (typeRep (Proxy @a))
 
 instance GGetConstructorTypeInfo U1 where
   gGetConstructorTypeInfo _ = emptyTypeInfo & tiStructure ?~ TSUnit
 
-instance GGetConstructorTypeInfo f => GGetConstructorTypeInfo (M1 D d f) where
+instance (GGetConstructorTypeInfo f) => GGetConstructorTypeInfo (M1 D d f) where
   gGetConstructorTypeInfo _ = gGetConstructorTypeInfo (Proxy :: Proxy (f p))
 
-instance GGetConstructorTypeInfo f => GGetConstructorTypeInfo (M1 C c f) where
+instance (GGetConstructorTypeInfo f) => GGetConstructorTypeInfo (M1 C c f) where
   gGetConstructorTypeInfo _ = gGetConstructorTypeInfo (Proxy :: Proxy (f p))
 
-instance GGetConstructorTypeInfo f => GGetConstructorTypeInfo (M1 S s f) where
+instance (GGetConstructorTypeInfo f) => GGetConstructorTypeInfo (M1 S s f) where
   gGetConstructorTypeInfo _ = gGetConstructorTypeInfo (Proxy :: Proxy (f p))
 
 -- For product types (tuples/records), create a TypeInfo with product structure
@@ -1800,29 +1794,33 @@ instance (GGetConstructorTypeInfo f, GGetConstructorTypeInfo g) => GGetConstruct
   gGetConstructorTypeInfo _ =
     let leftInfo = gGetConstructorTypeInfo (Proxy :: Proxy (f p))
         rightInfo = gGetConstructorTypeInfo (Proxy :: Proxy (g p))
-    in emptyTypeInfo & tiStructure ?~ TSProduct
-         [ FieldInfo Nothing leftInfo
-         , FieldInfo Nothing rightInfo
-         ]
+     in emptyTypeInfo
+          & tiStructure
+            ?~ TSProduct
+              [ FieldInfo Nothing leftInfo,
+                FieldInfo Nothing rightInfo
+              ]
 
 -- For nested sum types (multiple constructors within a branch)
 instance (GGetConstructorTypeInfo f, GGetConstructorTypeInfo g) => GGetConstructorTypeInfo (f :+: g) where
   gGetConstructorTypeInfo _ =
     let leftInfo = gGetConstructorTypeInfo (Proxy :: Proxy (f p))
         rightInfo = gGetConstructorTypeInfo (Proxy :: Proxy (g p))
-    in emptyTypeInfo & tiStructure ?~ TSSum [leftInfo, rightInfo]
-instance Typeable a => GGetStructure (K1 i a) where
+     in emptyTypeInfo & tiStructure ?~ TSSum [leftInfo, rightInfo]
+
+instance (Typeable a) => GGetStructure (K1 i a) where
   gGetStructure _ = case typeRep (Proxy @a) of
-    tr | tr == typeRep (Proxy @Int)         -> TSPrimitive PTInt
-       | tr == typeRep (Proxy @Double)      -> TSPrimitive PTDouble
-       | tr == typeRep (Proxy @Text)        -> TSPrimitive PTText
-       | tr == typeRep (Proxy @Bool)        -> TSPrimitive PTBool
-       | tr == typeRep (Proxy @Word64)      -> TSPrimitive PTWord64
-       | tr == typeRep (Proxy @Int32)       -> TSPrimitive PTInt32
-       | tr == typeRep (Proxy @Word32)      -> TSPrimitive PTWord32
-       | tr == typeRep (Proxy @Integer)     -> TSPrimitive PTInteger
-       | tr == typeRep (Proxy @ByteString)  -> TSPrimitive PTBytes
-       | otherwise -> error $ show tr
+    tr
+      | tr == typeRep (Proxy @Int) -> TSPrimitive PTInt
+      | tr == typeRep (Proxy @Double) -> TSPrimitive PTDouble
+      | tr == typeRep (Proxy @Text) -> TSPrimitive PTText
+      | tr == typeRep (Proxy @Bool) -> TSPrimitive PTBool
+      | tr == typeRep (Proxy @Word64) -> TSPrimitive PTWord64
+      | tr == typeRep (Proxy @Int32) -> TSPrimitive PTInt32
+      | tr == typeRep (Proxy @Word32) -> TSPrimitive PTWord32
+      | tr == typeRep (Proxy @Integer) -> TSPrimitive PTInteger
+      | tr == typeRep (Proxy @ByteString) -> TSPrimitive PTBytes
+      | otherwise -> error $ show tr
 
 -- Helper function for type parameter extraction
 extractTypeParams :: TypeRep -> [Text]
@@ -1833,7 +1831,7 @@ extractTypeParams tr = extractParams tr
     extractParams :: TypeRep -> [Text]
     extractParams typ =
       case typeRepArgs typ of
-        [] -> []  -- No type arguments
+        [] -> [] -- No type arguments
         args -> map showTypeParam args
 
     -- Convert a TypeRep to a readable parameter name
@@ -2055,13 +2053,13 @@ data ValidationError
 -- @
 data ErrorContext = ErrorContext
   { -- | Field path like ["user", "address", "street"] (innermost first)
-    _errorPath :: [Text]
+    _errorPath :: [Text],
     -- | What type was expected during deserialization
-  , _expectedType :: Maybe Text
+    _expectedType :: Maybe Text,
     -- | What value was actually found in the data
-  , _actualValue :: Maybe Text
+    _actualValue :: Maybe Text,
     -- | Helpful suggestions for fixing the problem
-  , _suggestions :: [Text]
+    _suggestions :: [Text]
   }
   deriving stock (Show, Eq)
 
@@ -2238,10 +2236,14 @@ class FromSZT a where
         storedConstructors = maybe [] (^. tiConstructors) storedTypeInfo
     -- Only validate if we have constructor info on both sides
     if not (null expectedConstructors) && not (null storedConstructors) && storedConstructors /= expectedConstructors
-      then Left $ ConstructorMismatch
-             ("constructors " <> Text.intercalate ", " expectedConstructors)
-             ("constructors " <> Text.intercalate ", " storedConstructors <>
-              ". Constructor order or names have changed.")
+      then
+        Left $
+          ConstructorMismatch
+            ("constructors " <> Text.intercalate ", " expectedConstructors)
+            ( "constructors "
+                <> Text.intercalate ", " storedConstructors
+                <> ". Constructor order or names have changed."
+            )
       else GHC.Generics.to <$> gFromSZT (_dvCore dynValue)
 
 -- | The default generic 'fromSzt' implementation as a standalone function.
@@ -2251,9 +2253,10 @@ class FromSZT a where
 -- instance FromSZT MyType where
 --   fromSzt = memoizedFromSzt defaultFromSzt
 -- @
-defaultFromSzt
-  :: forall a. (Generic a, GFromSZT (Rep a), GGetAllConstructorNames (Rep a))
-  => DynamicValue -> Either SZTError a
+defaultFromSzt ::
+  forall a.
+  (Generic a, GFromSZT (Rep a), GGetAllConstructorNames (Rep a)) =>
+  DynamicValue -> Either SZTError a
 defaultFromSzt dynValue = do
   let storedTypeInfo = _dvTypeInfo dynValue
       expectedConstructors = gGetAllConstructorNames (Proxy @(Rep a ()))
@@ -2265,7 +2268,8 @@ defaultFromSzt dynValue = do
       Left $
         ConstructorMismatch
           ("constructors " <> Text.intercalate ", " expectedConstructors)
-          ( "constructors " <> Text.intercalate ", " storedConstructors
+          ( "constructors "
+              <> Text.intercalate ", " storedConstructors
               <> ". Constructor order or names have changed."
           )
     else GHC.Generics.to <$> gFromSZT (_dvCore dynValue)
@@ -2381,20 +2385,20 @@ instance (FromSZT a) => FromSZT [a] where
 instance (ToSZT a, ToSZT b) => ToSZT (a, b) where
   toSzt (a, b) =
     DynamicValue
-      { _dvCore = DProduct [toSzt a, toSzt b]
-      , _dvTypeInfo =
+      { _dvCore = DProduct [toSzt a, toSzt b],
+        _dvTypeInfo =
           Just $
             TypeInfo
-              { _tiTypeName = Just "(,)"
-              , _tiModule = Just "GHC.Tuple"
-              , _tiConstructors = ["(,)"]
-              , _tiFieldLabels = []
-              , _tiStructure = Nothing -- Simplified
-              , _tiTypeParameters = []
-              , _tiNewtypeWrapper = Nothing
-              }
-      , _dvSchemaVersion = currentSchemaVersion
-      , _dvShallowId = Nothing
+              { _tiTypeName = Just "(,)",
+                _tiModule = Just "GHC.Tuple",
+                _tiConstructors = ["(,)"],
+                _tiFieldLabels = [],
+                _tiStructure = Nothing, -- Simplified
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
       }
 
 instance (FromSZT a, FromSZT b) => FromSZT (a, b) where
@@ -2409,20 +2413,20 @@ instance (FromSZT a, FromSZT b) => FromSZT (a, b) where
 instance (ToSZT a, ToSZT b, ToSZT c) => ToSZT (a, b, c) where
   toSzt (a, b, c) =
     DynamicValue
-      { _dvCore = DProduct [toSzt a, toSzt b, toSzt c]
-      , _dvTypeInfo =
+      { _dvCore = DProduct [toSzt a, toSzt b, toSzt c],
+        _dvTypeInfo =
           Just $
             TypeInfo
-              { _tiTypeName = Just "(,,)"
-              , _tiModule = Just "GHC.Tuple"
-              , _tiConstructors = ["(,,)"]
-              , _tiFieldLabels = []
-              , _tiStructure = Nothing
-              , _tiTypeParameters = []
-              , _tiNewtypeWrapper = Nothing
-              }
-      , _dvSchemaVersion = currentSchemaVersion
-      , _dvShallowId = Nothing
+              { _tiTypeName = Just "(,,)",
+                _tiModule = Just "GHC.Tuple",
+                _tiConstructors = ["(,,)"],
+                _tiFieldLabels = [],
+                _tiStructure = Nothing,
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
       }
 
 instance (FromSZT a, FromSZT b, FromSZT c) => FromSZT (a, b, c) where
@@ -2436,20 +2440,23 @@ instance (FromSZT a, FromSZT b, FromSZT c) => FromSZT (a, b, c) where
   fromSzt _ = Left (StructuralMismatch "Expected triple")
 
 instance (ToSZT a, ToSZT b, ToSZT c, ToSZT d) => ToSZT (a, b, c, d) where
-  toSzt (w, x, y, z) = DynamicValue
-    { _dvCore = DProduct [toSzt w, toSzt x, toSzt y, toSzt z]
-    , _dvTypeInfo = Just $ TypeInfo
-        { _tiTypeName = Just "(,,,)"
-        , _tiModule = Just "GHC.Tuple"
-        , _tiConstructors = ["(,,,)"]
-              , _tiFieldLabels = []
-        , _tiStructure = Nothing
-        , _tiTypeParameters = []
-        , _tiNewtypeWrapper = Nothing
-        }
-    , _dvSchemaVersion = currentSchemaVersion
-    , _dvShallowId = Nothing
-    }
+  toSzt (w, x, y, z) =
+    DynamicValue
+      { _dvCore = DProduct [toSzt w, toSzt x, toSzt y, toSzt z],
+        _dvTypeInfo =
+          Just $
+            TypeInfo
+              { _tiTypeName = Just "(,,,)",
+                _tiModule = Just "GHC.Tuple",
+                _tiConstructors = ["(,,,)"],
+                _tiFieldLabels = [],
+                _tiStructure = Nothing,
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
+      }
 
 instance (FromSZT a, FromSZT b, FromSZT c, FromSZT d) => FromSZT (a, b, c, d) where
   fromSzt (DynamicValue (DProduct [v1, v2, v3, v4]) _ _ _) = do
@@ -2465,9 +2472,9 @@ instance (FromSZT a, FromSZT b, FromSZT c, FromSZT d) => FromSZT (a, b, c, d) wh
 --------------------------------------------------------------------------------
 
 data TypeInfoPool = TypeInfoPool
-  { _tipNextId :: Word32
-  , _tipByName :: Map.Map (Maybe Text, Maybe Text) Word32  -- (module, name) -> ID
-  , _tipShared :: Map.Map Word32 Proto.TypeInfo
+  { _tipNextId :: Word32,
+    _tipByName :: Map.Map (Maybe Text, Maybe Text) Word32, -- (module, name) -> ID
+    _tipShared :: Map.Map Word32 Proto.TypeInfo
   }
 
 emptyTypeInfoPool :: TypeInfoPool
@@ -2481,15 +2488,16 @@ type TypeInfoM = State TypeInfoPool
 -- | Merge two TypeInfo structures, preferring the more complete one.
 -- Prefers non-Nothing fields and non-empty lists.
 mergeTypeInfo :: TypeInfo -> TypeInfo -> TypeInfo
-mergeTypeInfo ti1 ti2 = TypeInfo
-  { _tiTypeName = ti1 ^. tiTypeName <|> ti2 ^. tiTypeName
-  , _tiModule = ti1 ^. tiModule <|> ti2 ^. tiModule
-  , _tiConstructors = if null (ti1 ^. tiConstructors) then ti2 ^. tiConstructors else ti1 ^. tiConstructors
-  , _tiFieldLabels = if null (ti1 ^. tiFieldLabels) then ti2 ^. tiFieldLabels else ti1 ^. tiFieldLabels
-  , _tiStructure = ti1 ^. tiStructure <|> ti2 ^. tiStructure
-  , _tiTypeParameters = if null (ti1 ^. tiTypeParameters) then ti2 ^. tiTypeParameters else ti1 ^. tiTypeParameters
-  , _tiNewtypeWrapper = ti1 ^. tiNewtypeWrapper <|> ti2 ^. tiNewtypeWrapper
-  }
+mergeTypeInfo ti1 ti2 =
+  TypeInfo
+    { _tiTypeName = ti1 ^. tiTypeName <|> ti2 ^. tiTypeName,
+      _tiModule = ti1 ^. tiModule <|> ti2 ^. tiModule,
+      _tiConstructors = if null (ti1 ^. tiConstructors) then ti2 ^. tiConstructors else ti1 ^. tiConstructors,
+      _tiFieldLabels = if null (ti1 ^. tiFieldLabels) then ti2 ^. tiFieldLabels else ti1 ^. tiFieldLabels,
+      _tiStructure = ti1 ^. tiStructure <|> ti2 ^. tiStructure,
+      _tiTypeParameters = if null (ti1 ^. tiTypeParameters) then ti2 ^. tiTypeParameters else ti1 ^. tiTypeParameters,
+      _tiNewtypeWrapper = ti1 ^. tiNewtypeWrapper <|> ti2 ^. tiNewtypeWrapper
+    }
 
 -- | Intern a TypeInfo, recursively interning all nested TypeInfo structures.
 -- This ensures that constructor argument types and field types also appear
@@ -2522,7 +2530,6 @@ internTypeInfo (Just ti) = do
   case nameKey of
     -- Skip anonymous types (no name)
     (_, Nothing) -> pure Nothing
-
     -- FIXME this is dodgy, unused variables, etc.
     _ -> do
       TypeInfoPool nextId byName shared <- get
@@ -2534,10 +2541,10 @@ internTypeInfo (Just ti) = do
           -- We want to keep the better version (more complete)
           -- For now, we'll update with the merged version
           let _mergedTi = mergeTypeInfo ti (error "Cannot convert back from proto - using new ti")
-              -- Since we can't easily convert proto back to TypeInfo,
-              -- we'll just use the new one if it has structure, otherwise keep existing
+          -- Since we can't easily convert proto back to TypeInfo,
+          -- we'll just use the new one if it has structure, otherwise keep existing
           if isNothing (ti ^. tiStructure)
-            then pure (Just existingId)  -- Keep existing if new one has no structure
+            then pure (Just existingId) -- Keep existing if new one has no structure
             else do
               -- New one has structure - update the existing entry
               let protoTI = toProtoTypeInfo ti
@@ -2631,12 +2638,12 @@ toProtoDynamicCore typeInfo = \case
     encodedValue <- toProtoDynamicValueWith branchTi value
     pure $
       defMessage
-        Lens.& Proto.sum Lens..~
-          ( defMessage
-              Lens.& Proto.constructorIndex Lens..~ globalIndex
-              Lens.& Proto.constructorName Lens..~ constructorName
-              Lens.& Proto.value Lens..~ encodedValue
-          )
+        Lens.& Proto.sum
+          Lens..~ ( defMessage
+                      Lens.& Proto.constructorIndex Lens..~ globalIndex
+                      Lens.& Proto.constructorName Lens..~ constructorName
+                      Lens.& Proto.value Lens..~ encodedValue
+                  )
   DList values -> do
     let itemTi = case typeInfo >>= view tiStructure of
           Just (TSList ti) -> Just ti
@@ -2645,7 +2652,6 @@ toProtoDynamicCore typeInfo = \case
     pure $ defMessage Lens.& Proto.list Lens..~ (defMessage Lens.& Proto.elements Lens..~ encoded)
   DUnit -> pure $ defMessage Lens.& Proto.unit Lens..~ defMessage
   DReference refId -> pure $ defMessage Lens.& Proto.reference Lens..~ (defMessage Lens.& Proto.referenceId Lens..~ refId)
-
 
 lookupConstructorName :: Word32 -> TypeInfo -> Text
 lookupConstructorName index info = fromMaybe "" $ info ^? tiConstructors . ix (fromIntegral index)
@@ -2667,13 +2673,14 @@ toProtoPrimitiveValue = \case
 
 toProtoTypeInfo :: TypeInfo -> Proto.TypeInfo
 toProtoTypeInfo (TypeInfo name mod cons fieldLabels struct typeParams newtypeWrap) =
-  let base = defMessage
-        Lens.& Proto.typeName Lens..~ fromMaybe "" name
-        Lens.& Proto.moduleName Lens..~ fromMaybe "" mod
-        Lens.& Proto.constructors Lens..~ cons
-        Lens.& Proto.fieldLabels Lens..~ fieldLabels
-        Lens.& Proto.structure Lens..~ maybe defMessage toProtoTypeStructure struct
-        Lens.& Proto.typeParameters Lens..~ map toProtoTypeInfo typeParams
+  let base =
+        defMessage
+          Lens.& Proto.typeName Lens..~ fromMaybe "" name
+          Lens.& Proto.moduleName Lens..~ fromMaybe "" mod
+          Lens.& Proto.constructors Lens..~ cons
+          Lens.& Proto.fieldLabels Lens..~ fieldLabels
+          Lens.& Proto.structure Lens..~ maybe defMessage toProtoTypeStructure struct
+          Lens.& Proto.typeParameters Lens..~ map toProtoTypeInfo typeParams
    in case newtypeWrap of
         Nothing -> base
         Just wrapInfo -> base Lens.& Proto.newtypeWrapper Lens..~ toProtoTypeInfo wrapInfo
@@ -2722,21 +2729,27 @@ fromProtoDynamicValueWithOverride overrideTypeInfo schemaVersion typeTable proto
             Just referencedTi
               | referencedTi == inlineTi -> pure (Just inlineTi)
               | otherwise ->
-                  Left $ ValidationError $ InvalidSchema $
-                    "Type info mismatch between inline metadata and reference id "
-                      <> Text.pack (show refId)
+                  Left $
+                    ValidationError $
+                      InvalidSchema $
+                        "Type info mismatch between inline metadata and reference id "
+                          <> Text.pack (show refId)
             Nothing ->
-              Left $ ValidationError $ InvalidSchema $
-                "Unknown type_info_ref " <> Text.pack (show refId)
+              Left $
+                ValidationError $
+                  InvalidSchema $
+                    "Unknown type_info_ref " <> Text.pack (show refId)
           else pure (Just inlineTi)
       else
         if refId /= 0
           then case Map.lookup refId typeTable of
             Just ti -> pure (Just ti)
             Nothing ->
-              Left $ ValidationError $ InvalidSchema $
-                "Unknown type_info_ref " <> Text.pack (show refId)
-          else pure overrideTypeInfo  -- Use override only if proto has no type info
+              Left $
+                ValidationError $
+                  InvalidSchema $
+                    "Unknown type_info_ref " <> Text.pack (show refId)
+          else pure overrideTypeInfo -- Use override only if proto has no type info
   core <- fromProtoDynamicCore schemaVersion typeTable resolvedTypeInfo (protoDV Lens.^. Proto.core)
   return $ DynamicValue core resolvedTypeInfo schemaVersion Nothing
 
@@ -2754,11 +2767,17 @@ fromProtoDynamicCore schemaVersion typeTable typeInfo protoCore =
         Just ti ->
           let expectedName = lookupConstructorName providedIndex ti
            in if storedName /= expectedName && not (Text.null storedName)
-                then Left $ ValidationError $ InvalidSchema $
-                       "Constructor name mismatch: stored '" <> storedName
-                       <> "' but expected '" <> expectedName
-                       <> "' at index " <> Text.pack (show providedIndex)
-                       <> ". This likely means the constructor order changed in the type definition."
+                then
+                  Left $
+                    ValidationError $
+                      InvalidSchema $
+                        "Constructor name mismatch: stored '"
+                          <> storedName
+                          <> "' but expected '"
+                          <> expectedName
+                          <> "' at index "
+                          <> Text.pack (show providedIndex)
+                          <> ". This likely means the constructor order changed in the type definition."
                 else do
                   -- Decode with branchInfo as override if the proto value doesn't have type info
                   value <- fromProtoDynamicValueWithOverride branchInfo schemaVersion typeTable (sum' Lens.^. Proto.value)
@@ -2787,15 +2806,14 @@ fromProtoPrimitiveValue protoPV =
     Nothing -> Left $ ProtocolBufferError (MissingField "primitive")
 
 fromProtoTypeInfo :: Proto.TypeInfo -> Either SerializotronError TypeInfo
-
 mkInvalidSchema :: Text -> Either SerializotronError a
 mkInvalidSchema msg = Left (ValidationError (InvalidSchema msg))
 
 findDuplicateLabels :: [Text] -> [Text]
 findDuplicateLabels labels =
   [ label
-  | (label, count) <- Map.toList (Map.fromListWith (+) [(label, 1 :: Int) | label <- labels])
-  , count > 1
+  | (label, count) <- Map.toList (Map.fromListWith (+) [(label, 1 :: Int) | label <- labels]),
+    count > 1
   ]
 
 formatLabels :: [Text] -> Text
@@ -2845,6 +2863,7 @@ fromProtoTypeInfo protoTI = do
           typeParams
           newtypeWrap
   normalizeTypeInfo info
+
 fromProtoTypeStructure :: Proto.TypeStructure -> Either SerializotronError TypeStructure
 fromProtoTypeStructure protoTS =
   case protoTS Lens.^. Proto.maybe'structure of
@@ -2895,21 +2914,20 @@ data FsckWarning
 
 -- | Statistics from integrity check
 data FsckStats = FsckStats
-  { _fsckTotalReferences :: Int
-  , _fsckSharedValues :: Int
-  , _fsckDanglingReferences :: Int
+  { _fsckTotalReferences :: Int,
+    _fsckSharedValues :: Int,
+    _fsckDanglingReferences :: Int
   }
   deriving stock (Show, Eq)
 
 makeLenses ''FsckStats
 
-
 -- | Results of integrity verification
 data FsckResult = FsckResult
-  { _fsckPassed :: Bool
-  , _fsckErrors :: [FsckError]
-  , _fsckWarnings :: [FsckWarning]
-  , _fsckStats :: FsckStats
+  { _fsckPassed :: Bool,
+    _fsckErrors :: [FsckError],
+    _fsckWarnings :: [FsckWarning],
+    _fsckStats :: FsckStats
   }
   deriving stock (Show, Eq)
 
@@ -2974,17 +2992,18 @@ performFsck rootValue sharedTable =
       cycles = detectCycles rootValue validSharedTable
 
       -- Build errors and warnings
-      errors = map FsckDanglingReference danglingRefs
-            ++ map CyclicReference cycles
-            ++ corruptionErrors
+      errors =
+        map FsckDanglingReference danglingRefs
+          ++ map CyclicReference cycles
+          ++ corruptionErrors
 
       warnings = map UnusedSharedValue unusedValues
 
       stats =
         FsckStats
-          { _fsckTotalReferences = length usedReferences
-          , _fsckSharedValues = Map.size validSharedTable
-          , _fsckDanglingReferences = length danglingRefs
+          { _fsckTotalReferences = length usedReferences,
+            _fsckSharedValues = Map.size validSharedTable,
+            _fsckDanglingReferences = length danglingRefs
           }
    in FsckResult (null errors) errors warnings stats
 
@@ -3520,13 +3539,13 @@ extractTypeInfo (SomeTypeMetadata (_ :: Proxy a)) =
       -- Get type parameters
       typeParams = map typeInfoForRep (typeRepArgs rep)
    in TypeInfo
-        { _tiTypeName = Just nameText
-        , _tiModule = Just moduleText
-        , _tiConstructors = gGetAllConstructorNames (Proxy @(Rep a ()))
-        , _tiFieldLabels = []  -- Will be filled in by recursive interning when structure is encountered
-        , _tiStructure = Just $ gGetCompleteStructure (Proxy @(Rep a ()))
-        , _tiTypeParameters = typeParams
-        , _tiNewtypeWrapper = Nothing  -- Will be populated by Generic derivation if applicable
+        { _tiTypeName = Just nameText,
+          _tiModule = Just moduleText,
+          _tiConstructors = gGetAllConstructorNames (Proxy @(Rep a ())),
+          _tiFieldLabels = [], -- Will be filled in by recursive interning when structure is encountered
+          _tiStructure = Just $ gGetCompleteStructure (Proxy @(Rep a ())),
+          _tiTypeParameters = typeParams,
+          _tiNewtypeWrapper = Nothing -- Will be populated by Generic derivation if applicable
         }
 
 -- | Save type metadata to an .szt file without needing actual values.
@@ -3570,9 +3589,10 @@ saveSztMetadataWithCompression compression path types = do
 
   -- Intern all types using our recursive interning logic
   -- This will capture all nested types automatically
-  let (_, protoSharedTypes) = runState
-        (mapM_ (internTypeInfo . Just) typeInfos)
-        emptyTypeInfoPool
+  let (_, protoSharedTypes) =
+        runState
+          (mapM_ (internTypeInfo . Just) typeInfos)
+          emptyTypeInfoPool
 
   -- Create an .szt file with empty root value but full type pool
   -- We use DUnit as a placeholder root value since we only care about the type pool
@@ -3683,9 +3703,10 @@ resetToSztMemoCache = writeIORef toSztMemoCache Map.empty
 -- /Requires 'withSztMemoization' around the serialisation call to reset
 -- the cache./
 {-# NOINLINE memoizedToSzt #-}
-memoizedToSzt
-  :: forall a. (ShallowIdentifiable a, Typeable a)
-  => (a -> DynamicValue) -> a -> DynamicValue
+memoizedToSzt ::
+  forall a.
+  (ShallowIdentifiable a, Typeable a) =>
+  (a -> DynamicValue) -> a -> DynamicValue
 memoizedToSzt f x = unsafePerformIO $ do
   let !sid = shallowIdentifier x
       key = (typeRep (Proxy @a), sid)
@@ -3694,7 +3715,7 @@ memoizedToSzt f x = unsafePerformIO $ do
       Just dv -> (cache, dv)
       Nothing ->
         let !dv = f x
-        in (Map.insert key dv cache, dv)
+         in (Map.insert key dv cache, dv)
 
 -- | Global cache for 'memoizedFromSzt'. Keyed by (TypeRep, shallowId).
 -- Stores values as 'Dynamic' for type-safe heterogeneous storage.
@@ -3715,10 +3736,12 @@ resetFromSztMemoCache = writeIORef fromSztMemoCache Map.empty
 --
 -- /Requires 'withSztMemoization' around the deserialisation call./
 {-# NOINLINE memoizedFromSzt #-}
-memoizedFromSzt
-  :: forall a. (Typeable a)
-  => (DynamicValue -> Either SZTError a)
-  -> DynamicValue -> Either SZTError a
+memoizedFromSzt ::
+  forall a.
+  (Typeable a) =>
+  (DynamicValue -> Either SZTError a) ->
+  DynamicValue ->
+  Either SZTError a
 memoizedFromSzt f dv = case _dvShallowId dv of
   Nothing -> f dv
   Just sid -> unsafePerformIO $ do

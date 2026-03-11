@@ -4,7 +4,7 @@ import Data.Text (unpack)
 import GHC.Generics
 import Serializotron
 
-data Foo = A Int | B Int  -- Same constructor order as SaveFoo
+data Foo = A Int | B Int -- Same constructor order as SaveFoo
   deriving stock (Generic, Show, Eq)
   deriving anyclass (ToSZT, FromSZT)
 

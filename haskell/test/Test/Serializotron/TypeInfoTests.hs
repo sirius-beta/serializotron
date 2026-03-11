@@ -4,35 +4,39 @@
 -- | Tests for Generic TypeInfo extraction, particularly the product type instance
 module Test.Serializotron.TypeInfoTests where
 
-import GHC.Generics
-import Data.Text (Text)
-import Hedgehog
-import qualified Hedgehog.Gen as Gen
-import qualified Hedgehog.Range as Range
 import Control.Lens ((^.))
-
+import Data.Text (Text)
+import GHC.Generics
+import Hedgehog
+import Hedgehog.Gen qualified as Gen
+import Hedgehog.Range qualified as Range
 import Serializotron
-import Serializotron.Instances () -- For Maybe and Either instances
+import Serializotron.Instances ()
+
+-- For Maybe and Either instances
 
 --------------------------------------------------------------------------------
 -- Test Data Types
 --------------------------------------------------------------------------------
 
 -- Simple product type (Text :*: Int)
-data Person = Person Text Int 
+data Person = Person Text Int
   deriving stock (Generic, Eq, Show)
 
 instance ToSZT Person
+
 instance FromSZT Person
 
 -- Product with three fields
 data Employee = Employee
-  { empName :: Text
-  , empAge :: Int
-  , empSalary :: Double
-  } deriving stock (Generic, Eq, Show)
+  { empName :: Text,
+    empAge :: Int,
+    empSalary :: Double
+  }
+  deriving stock (Generic, Eq, Show)
 
 instance ToSZT Employee
+
 instance FromSZT Employee
 
 -- Single field record
@@ -40,6 +44,7 @@ newtype Solo = Solo Int
   deriving stock (Generic, Eq, Show)
 
 instance ToSZT Solo
+
 instance FromSZT Solo
 
 -- Empty constructor
@@ -47,6 +52,7 @@ data Unit = Unit
   deriving stock (Generic, Eq, Show)
 
 instance ToSZT Unit
+
 instance FromSZT Unit
 
 -- Sum type with products
@@ -57,6 +63,7 @@ data Shape
   deriving stock (Generic, Eq, Show)
 
 instance ToSZT Shape
+
 instance FromSZT Shape
 
 -- Simple sum type for testing constructor completeness
@@ -64,6 +71,7 @@ data Color = Red | Green | Blue
   deriving stock (Generic, Eq, Show)
 
 instance ToSZT Color
+
 instance FromSZT Color
 
 -- Newtype wrappers for testing newtype wrapper tracking
@@ -71,12 +79,14 @@ newtype UserId = UserId Int
   deriving stock (Generic, Eq, Show)
 
 instance ToSZT UserId
+
 instance FromSZT UserId
 
 newtype UserName = UserName Text
   deriving stock (Generic, Eq, Show)
 
 instance ToSZT UserName
+
 instance FromSZT UserName
 
 -- Chained newtypes: WrapperId wraps UserId which wraps Int
@@ -84,15 +94,18 @@ newtype WrapperId = WrapperId UserId
   deriving stock (Generic, Eq, Show)
 
 instance ToSZT WrapperId
+
 instance FromSZT WrapperId
 
 -- Product type containing newtypes
 data User = User
-  { userId :: UserId
-  , userName :: UserName
-  } deriving stock (Generic, Eq, Show)
+  { userId :: UserId,
+    userName :: UserName
+  }
+  deriving stock (Generic, Eq, Show)
 
 instance ToSZT User
+
 instance FromSZT User
 
 --------------------------------------------------------------------------------
@@ -106,10 +119,11 @@ genPerson :: Gen Person
 genPerson = Person <$> genText <*> Gen.int (Range.linear 0 120)
 
 genEmployee :: Gen Employee
-genEmployee = Employee 
-  <$> genText 
-  <*> Gen.int (Range.linear 18 100)
-  <*> Gen.double (Range.exponentialFloat 0 1000000)
+genEmployee =
+  Employee
+    <$> genText
+    <*> Gen.int (Range.linear 18 100)
+    <*> Gen.double (Range.exponentialFloat 0 1000000)
 
 genSolo :: Gen Solo
 genSolo = Solo <$> Gen.int (Range.linear minBound maxBound)
@@ -118,14 +132,17 @@ genUnit :: Gen Unit
 genUnit = pure Unit
 
 genShape :: Gen Shape
-genShape = Gen.choice
-  [ Circle <$> Gen.double (Range.exponentialFloat 0.1 100)
-  , Rectangle <$> Gen.double (Range.exponentialFloat 0.1 100) 
-               <*> Gen.double (Range.exponentialFloat 0.1 100)
-  , Triangle <$> Gen.double (Range.exponentialFloat 0.1 100)
-             <*> Gen.double (Range.exponentialFloat 0.1 100)
-             <*> Gen.double (Range.exponentialFloat 0.1 100)
-  ]
+genShape =
+  Gen.choice
+    [ Circle <$> Gen.double (Range.exponentialFloat 0.1 100),
+      Rectangle
+        <$> Gen.double (Range.exponentialFloat 0.1 100)
+        <*> Gen.double (Range.exponentialFloat 0.1 100),
+      Triangle
+        <$> Gen.double (Range.exponentialFloat 0.1 100)
+        <*> Gen.double (Range.exponentialFloat 0.1 100)
+        <*> Gen.double (Range.exponentialFloat 0.1 100)
+    ]
 
 genColor :: Gen Color
 genColor = Gen.choice [pure Red, pure Green, pure Blue]
@@ -158,7 +175,7 @@ prop_person_typeinfo = property $ do
       typeInfo ^. tiTypeName === Just "Person"
       typeInfo ^. tiModule === Just "Test.Serializotron.TypeInfoTests"
       typeInfo ^. tiConstructors === ["Person"]
-      
+
       -- Check that the structure shows a product
       case typeInfo ^. tiStructure of
         Just (TSProduct components) -> do
@@ -184,7 +201,7 @@ prop_employee_typeinfo = property $ do
     Just typeInfo -> do
       typeInfo ^. tiTypeName === Just "Employee"
       typeInfo ^. tiConstructors === ["Employee"]
-      
+
       -- Verify the structure
       case typeInfo ^. tiStructure of
         Just (TSProduct _) -> success
@@ -225,16 +242,16 @@ prop_shape_typeinfo = property $ do
       annotate $ "TypeInfo: " ++ show typeInfo
       annotate $ "Shape value: " ++ show shape
       typeInfo ^. tiTypeName === Just "Shape"
-      
+
       -- ALL constructors should be present regardless of which one is active
       typeInfo ^. tiConstructors === ["Circle", "Rectangle", "Triangle"]
-      
+
       -- The structure should be a sum type with binary tree structure
       case typeInfo ^. tiStructure of
         Just (TSSum constructorTypes) -> do
           annotate $ "Sum type has " ++ show (length constructorTypes) ++ " constructor types"
           -- Generic representation uses binary trees, so we get 2 at the top level
-          length constructorTypes === 2  -- Binary tree: Circle :+: (Rectangle :+: Triangle)
+          length constructorTypes === 2 -- Binary tree: Circle :+: (Rectangle :+: Triangle)
         Just other -> do
           annotate $ "Expected TSSum but got: " ++ show other
           failure
@@ -254,15 +271,15 @@ prop_color_complete_constructors = property $ do
     Just typeInfo -> do
       annotate $ "Color value: " ++ show color
       annotate $ "TypeInfo: " ++ show typeInfo
-      
+
       -- Should have all constructors regardless of which color we serialized
       typeInfo ^. tiConstructors === ["Red", "Green", "Blue"]
       typeInfo ^. tiTypeName === Just "Color"
-      
-      -- Structure should be sum type with binary tree structure  
+
+      -- Structure should be sum type with binary tree structure
       case typeInfo ^. tiStructure of
         Just (TSSum constructorTypes) -> do
-          length constructorTypes === 2  -- Binary tree: Red :+: (Green :+: Blue)
+          length constructorTypes === 2 -- Binary tree: Red :+: (Green :+: Blue)
         Just other -> do
           annotate $ "Expected TSSum but got: " ++ show other
           failure
@@ -275,14 +292,14 @@ prop_color_typeinfo_consistency = property $ do
   let redInfo = toSzt Red ^. dvTypeInfo
   let greenInfo = toSzt Green ^. dvTypeInfo
   let blueInfo = toSzt Blue ^. dvTypeInfo
-  
+
   case (redInfo, greenInfo, blueInfo) of
     (Just red, Just green, Just blue) -> do
       -- All three should have identical constructor lists
       red ^. tiConstructors === green ^. tiConstructors
       green ^. tiConstructors === blue ^. tiConstructors
       red ^. tiConstructors === ["Red", "Green", "Blue"]
-      
+
       -- All should have same type name
       red ^. tiTypeName === green ^. tiTypeName
       green ^. tiTypeName === blue ^. tiTypeName
@@ -475,7 +492,7 @@ prop_person_roundtrip = property $ do
       failure
     Right decoded -> person === decoded
 
--- | Test that Employee round-trips correctly  
+-- | Test that Employee round-trips correctly
 prop_employee_roundtrip :: Property
 prop_employee_roundtrip = property $ do
   employee <- forAll genEmployee

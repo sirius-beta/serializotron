@@ -2,24 +2,26 @@
 
 module Test.Serializotron.ShallowExampleTests where
 
-import Test.Tasty
-import Test.Tasty.HUnit
-import Data.Text qualified as Text
 import Data.HashSet qualified as HS
+import Data.Text qualified as Text
 import Serializotron
 import Serializotron.ShallowExample
-import System.IO.Temp (withSystemTempDirectory)
-import System.FilePath ((</>))
 import System.Directory (getFileSize)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
+import Test.Tasty
+import Test.Tasty.HUnit
 
 shallowExampleTests :: TestTree
-shallowExampleTests = testGroup "Shallow Serialization Example Tests"
-  [ testCase "Grid topology model roundtrip" testGridTopologyRoundtrip
-  , testCase "Network topology model roundtrip" testNetworkModelRoundtrip
-  , testCase "Large model with shared topology roundtrip" testLargeModelRoundtrip
-  , testCase "Deduplication effectiveness on shared topology" testDeduplicationEffectiveness
-  , testCase "Shallow identifier uniqueness" testShallowIdentifierUniqueness
-  ]
+shallowExampleTests =
+  testGroup
+    "Shallow Serialization Example Tests"
+    [ testCase "Grid topology model roundtrip" testGridTopologyRoundtrip,
+      testCase "Network topology model roundtrip" testNetworkModelRoundtrip,
+      testCase "Large model with shared topology roundtrip" testLargeModelRoundtrip,
+      testCase "Deduplication effectiveness on shared topology" testDeduplicationEffectiveness,
+      testCase "Shallow identifier uniqueness" testShallowIdentifierUniqueness
+    ]
 
 testGridTopologyRoundtrip :: Assertion
 testGridTopologyRoundtrip = withSystemTempDirectory "szt-test" $ \tmpDir -> do
@@ -76,14 +78,16 @@ testDeduplicationEffectiveness = withSystemTempDirectory "szt-test" $ \tmpDir ->
   sizeDefault <- getFileSize filepathDefault
   sizeAggressive <- getFileSize filepathAggressive
 
-
   assertBool "Default deduplication should reduce file size" (sizeDefault < sizeNone)
-  assertBool "Aggressive deduplication should reduce file size at least as much as default"
+  assertBool
+    "Aggressive deduplication should reduce file size at least as much as default"
     (sizeAggressive <= sizeDefault)
 
-  assertBool "Default deduplication should achieve significant compression (at least 100x)"
+  assertBool
+    "Default deduplication should achieve significant compression (at least 100x)"
     (fromIntegral sizeNone / fromIntegral sizeDefault > (100.0 :: Double))
-  assertBool "Aggressive deduplication should achieve significant compression (at least 100x)"
+  assertBool
+    "Aggressive deduplication should achieve significant compression (at least 100x)"
     (fromIntegral sizeNone / fromIntegral sizeAggressive > (100.0 :: Double))
 
 testShallowIdentifierUniqueness :: Assertion
@@ -95,13 +99,16 @@ testShallowIdentifierUniqueness = do
       domain2 = mkDomain topology1 (HS.fromList ["(1,0)", "(1,1)"])
       domain3 = mkDomain topology2 (HS.fromList ["R1", "R2"])
 
-  assertBool "Different topologies should have different shallow IDs"
+  assertBool
+    "Different topologies should have different shallow IDs"
     (shallowIdentifier topology1 /= shallowIdentifier topology2)
 
-  assertBool "Domains with different subsets should have different shallow IDs"
+  assertBool
+    "Domains with different subsets should have different shallow IDs"
     (shallowIdentifier domain1 /= shallowIdentifier domain2)
 
-  assertBool "Domains with different topologies should have different shallow IDs"
+  assertBool
+    "Domains with different topologies should have different shallow IDs"
     (shallowIdentifier domain1 /= shallowIdentifier domain3)
 
   let domain1Copy = mkDomain topology1 (HS.fromList ["(0,0)", "(0,1)"])

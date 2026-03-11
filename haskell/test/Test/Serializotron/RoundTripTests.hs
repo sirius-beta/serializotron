@@ -1,46 +1,43 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 
 -- | Comprehensive round-trip property tests for Serializotron
--- 
+--
 -- This module is heavily inspired by and adapted from the aeson library's
 -- round-trip property tests, particularly:
 --   - aeson/tests/PropertyRoundTrip.hs
 --   - aeson/tests/PropUtils.hs
--- 
+--
 -- The test structure, type coverage, and property-based testing approach
 -- closely follows aeson's methodology to ensure comprehensive coverage
 -- of serialization round-trips for standard Haskell types.
 --
 -- Original aeson code: https://github.com/haskell/aeson
 -- License: BSD-3-Clause
-
 module Test.Serializotron.RoundTripTests where
 
-import Hedgehog
-import qualified Hedgehog.Gen as Gen
-import qualified Hedgehog.Range as Range
 import Control.Monad.IO.Class (liftIO)
-
 -- Standard library imports
-import Data.Text (Text)
-import qualified Data.Text.Lazy as LText
-import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
-import Data.Int (Int8, Int16, Int32, Int64)
-import Data.Word (Word8, Word16, Word32, Word64)
-import Data.List.NonEmpty (NonEmpty(..))
-import qualified Data.Map.Strict as Map
-import qualified Data.HashMap.Strict as HashMap
-import qualified Data.Set as Set
-import qualified Data.HashSet as HashSet
-import qualified Data.Vector as Vector
-import Data.Hashable (Hashable)
-import Data.Time
-import Data.Ratio ((%))
-import Numeric.Natural (Natural)
 
+import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
+import Data.HashMap.Strict qualified as HashMap
+import Data.HashSet qualified as HashSet
+import Data.Hashable (Hashable)
+import Data.Int (Int16, Int32, Int64, Int8)
+import Data.List.NonEmpty (NonEmpty (..))
+import Data.Map.Strict qualified as Map
+import Data.Ratio ((%))
+import Data.Set qualified as Set
+import Data.Text (Text)
+import Data.Text.Lazy qualified as LText
+import Data.Time
+import Data.Vector qualified as Vector
+import Data.Word (Word16, Word32, Word64, Word8)
+import Hedgehog
+import Hedgehog.Gen qualified as Gen
+import Hedgehog.Range qualified as Range
+import Numeric.Natural (Natural)
 import Serializotron
 import Serializotron.Instances -- For all the type class instances
 
@@ -81,31 +78,33 @@ genWord64 = Gen.word64 Range.constantBounded
 genInteger :: Gen Integer
 genInteger = Gen.integral $ Range.linear (-bigInteger) bigInteger
 
-bigInteger :: Integer  
+bigInteger :: Integer
 bigInteger = (10 :: Integer) ^ (100 :: Integer)
-  
+
 -- | Generate natural numbers
 genNatural :: Gen Natural
 genNatural = fromIntegral <$> Gen.integral (Range.linear 0 bigInteger)
 
 -- | Generate doubles (with special values)
 genDouble :: Gen Double
-genDouble = Gen.choice
-  [ Gen.double (Range.exponentialFloat (-1e308) 1e308)
-  , pure (0 / 0)        -- NaN
-  , pure (1 / 0)        -- Infinity
-  , pure ((-1) / 0)     -- -Infinity
-  , pure 0
-  , pure (-0)
-  ]
+genDouble =
+  Gen.choice
+    [ Gen.double (Range.exponentialFloat (-1e308) 1e308),
+      pure (0 / 0), -- NaN
+      pure (1 / 0), -- Infinity
+      pure ((-1) / 0), -- -Infinity
+      pure 0,
+      pure (-0)
+    ]
 
 -- | Generate finite doubles (excluding NaN and Infinity for use in compound types)
 genFiniteDouble :: Gen Double
-genFiniteDouble = Gen.choice
-  [ Gen.double (Range.exponentialFloat (-1e308) 1e308)
-  , pure 0
-  , pure (-0)
-  ]
+genFiniteDouble =
+  Gen.choice
+    [ Gen.double (Range.exponentialFloat (-1e308) 1e308),
+      pure 0,
+      pure (-0)
+    ]
 
 -- | Generate floats
 genFloat :: Gen Float
@@ -151,7 +150,7 @@ genDay :: Gen Day
 genDay = do
   year <- Gen.integral (Range.linear 1600 2400)
   month <- Gen.int (Range.linear 1 12)
-  day <- Gen.int (Range.linear 1 28)  -- Safe for all months
+  day <- Gen.int (Range.linear 1 28) -- Safe for all months
   pure $ fromGregorian year month day
 
 -- | Generate TimeOfDay
@@ -299,13 +298,13 @@ approxDouble x y
 
 -- | Approximate equality for Vector Double
 approxVectorDouble :: Vector.Vector Double -> Vector.Vector Double -> Bool
-approxVectorDouble v1 v2 
+approxVectorDouble v1 v2
   | Vector.length v1 /= Vector.length v2 = False
   | otherwise = Vector.and $ Vector.zipWith approxDouble v1 v2
 
 -- | Approximate equality for tuples containing doubles
 approxQuadruple :: (Eq a, Eq b, Eq c) => (a, b, c, Double) -> (a, b, c, Double) -> Bool
-approxQuadruple (a1, b1, c1, d1) (a2, b2, c2, d2) = 
+approxQuadruple (a1, b1, c1, d1) (a2, b2, c2, d2) =
   a1 == a2 && b1 == b2 && c1 == c2 && approxDouble d1 d2
 
 --------------------------------------------------------------------------------
@@ -390,7 +389,7 @@ prop_roundtrip_utctime :: Property
 prop_roundtrip_utctime = testRoundTrip genUTCTime
 
 -- Note: ZonedTime doesn't have an Eq instance by default
--- prop_roundtrip_zonedtime :: Property  
+-- prop_roundtrip_zonedtime :: Property
 -- prop_roundtrip_zonedtime = testRoundTrip genZonedTime
 
 prop_roundtrip_difftime :: Property
@@ -465,12 +464,13 @@ prop_roundtrip_shallow_text_tuple_list :: Property
 prop_roundtrip_shallow_text_tuple_list = testRoundTripShallow "text_tuple_list" genTextTupleList4
   where
     genTextTupleList4 :: Gen [(Text, Text)]
-    genTextTupleList4 = pure
-      [ ("a", "b")
-      , ("c", "c")
-      , ("c", "a")
-      , ("a", "a")
-      ]
+    genTextTupleList4 =
+      pure
+        [ ("a", "b"),
+          ("c", "c"),
+          ("c", "a"),
+          ("a", "a")
+        ]
 
 -- | Property test for random lists of Text tuples with shallow serialization
 prop_roundtrip_shallow_list_text_tuples :: Property

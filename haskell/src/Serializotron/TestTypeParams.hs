@@ -2,10 +2,10 @@
 
 module Serializotron.TestTypeParams where
 
-import Serializotron
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Maybe (fromMaybe)
+import Serializotron
 
 testTypeParams :: IO ()
 testTypeParams = do

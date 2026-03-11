@@ -1,10 +1,10 @@
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
 -- | Additional ToSZT/FromSZT instances for standard library types
--- 
+--
 -- The type coverage and serialization patterns in this module are inspired
 -- by aeson's approach to handling standard Haskell types, ensuring compatibility
 -- with the same broad range of types that aeson supports.
@@ -13,47 +13,49 @@
 -- alternative with similar type coverage to aeson.
 --
 -- Reference: https://github.com/haskell/aeson
-
 module Serializotron.Instances where
 
-import Serializotron
-import Data.Text (Text)
-import qualified Data.Text as Text
-import Data.Typeable (Proxy(..), Typeable, typeRep)
-import qualified Data.Text.Lazy as LText
-import Data.Int (Int8, Int16, Int32, Int64)
-import Data.Word (Word8, Word16, Word32, Word64)
-import Data.List.NonEmpty (NonEmpty(..))
-import qualified Data.List.NonEmpty as NE
-import qualified Data.Map.Strict as Map
-import qualified Data.HashMap.Strict as HashMap
-import qualified Data.Set as Set
-import qualified Data.HashSet as HashSet
-import qualified Data.Vector as Vector
+import Data.HashMap.Strict qualified as HashMap
+import Data.HashSet qualified as HashSet
 import Data.Hashable (Hashable)
-import qualified Data.Time as Time
-import Data.Ratio (numerator, denominator, (%))
+import Data.Int (Int16, Int32, Int64, Int8)
+import Data.List.NonEmpty (NonEmpty (..))
+import Data.List.NonEmpty qualified as NE
+import Data.Map.Strict qualified as Map
+import Data.Ratio (denominator, numerator, (%))
+import Data.Set qualified as Set
+import Data.Text (Text)
+import Data.Text qualified as Text
+import Data.Text.Lazy qualified as LText
+import Data.Time qualified as Time
+import Data.Typeable (Proxy (..), Typeable, typeRep)
+import Data.Vector qualified as Vector
+import Data.Word (Word16, Word32, Word64, Word8)
 import Numeric.Natural (Natural)
+import Serializotron
 
 --------------------------------------------------------------------------------
 -- Unit type
 --------------------------------------------------------------------------------
 
 instance ToSZT () where
-  toSzt () = DynamicValue
-    { _dvCore = DUnit
-    , _dvTypeInfo = Just $ TypeInfo
-        { _tiTypeName = Just "()"
-        , _tiModule = Just "GHC.Tuple"
-        , _tiConstructors = ["()"]
-        , _tiFieldLabels = []
-        , _tiStructure = Just TSUnit
-        , _tiTypeParameters = []
-        , _tiNewtypeWrapper = Nothing
-        }
-    , _dvSchemaVersion = currentSchemaVersion
-    , _dvShallowId = Nothing
-    }
+  toSzt () =
+    DynamicValue
+      { _dvCore = DUnit,
+        _dvTypeInfo =
+          Just $
+            TypeInfo
+              { _tiTypeName = Just "()",
+                _tiModule = Just "GHC.Tuple",
+                _tiConstructors = ["()"],
+                _tiFieldLabels = [],
+                _tiStructure = Just TSUnit,
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
+      }
 
 instance FromSZT () where
   fromSzt (DynamicValue DUnit _ _ _) = Right ()
@@ -64,7 +66,7 @@ instance FromSZT () where
 --------------------------------------------------------------------------------
 
 instance ToSZT Int8 where
-  toSzt x = toSzt (fromIntegral x :: Int32)  -- Use Int32 container
+  toSzt x = toSzt (fromIntegral x :: Int32) -- Use Int32 container
 
 instance FromSZT Int8 where
   fromSzt dv = do
@@ -74,7 +76,7 @@ instance FromSZT Int8 where
       else Left (StructuralMismatch "Int8 out of range")
 
 instance ToSZT Int16 where
-  toSzt x = toSzt (fromIntegral x :: Int32)  -- Use Int32 container
+  toSzt x = toSzt (fromIntegral x :: Int32) -- Use Int32 container
 
 instance FromSZT Int16 where
   fromSzt dv = do
@@ -84,36 +86,39 @@ instance FromSZT Int16 where
       else Left (StructuralMismatch "Int16 out of range")
 
 instance ToSZT Int32 where
-  toSzt x = DynamicValue
-    { _dvCore = DPrimitive (PInt32 x)
-    , _dvTypeInfo = Just $ TypeInfo
-        { _tiTypeName = Just "Int32"
-        , _tiModule = Just "GHC.Int"
-        , _tiConstructors = []
-        , _tiFieldLabels = []
-        , _tiStructure = Just (TSPrimitive PTInt32)
-        , _tiTypeParameters = []
-        , _tiNewtypeWrapper = Nothing
-        }
-    , _dvSchemaVersion = currentSchemaVersion
-    , _dvShallowId = Nothing
-    }
+  toSzt x =
+    DynamicValue
+      { _dvCore = DPrimitive (PInt32 x),
+        _dvTypeInfo =
+          Just $
+            TypeInfo
+              { _tiTypeName = Just "Int32",
+                _tiModule = Just "GHC.Int",
+                _tiConstructors = [],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSPrimitive PTInt32),
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
+      }
 
 instance FromSZT Int32 where
   fromSzt (DynamicValue (DPrimitive (PInt32 x)) _ _ _) = Right x
   fromSzt _ = Left (PrimitiveMismatch "Int32" "other")
 
 instance ToSZT Int64 where
-  toSzt x = toSzt (fromIntegral x :: Int)  -- Int64 -> Int (both are int64 in protobuf)
+  toSzt x = toSzt (fromIntegral x :: Int) -- Int64 -> Int (both are int64 in protobuf)
 
 instance FromSZT Int64 where
   fromSzt dv = do
     i <- fromSzt dv :: Either SZTError Int
-    Right (fromIntegral i)  -- No range check needed, both are 64-bit
+    Right (fromIntegral i) -- No range check needed, both are 64-bit
 
 -- Word instances
 instance ToSZT Word8 where
-  toSzt x = toSzt (fromIntegral x :: Word32)  -- Use Word32 container
+  toSzt x = toSzt (fromIntegral x :: Word32) -- Use Word32 container
 
 instance FromSZT Word8 where
   fromSzt dv = do
@@ -123,7 +128,7 @@ instance FromSZT Word8 where
       else Left (StructuralMismatch "Word8 out of range")
 
 instance ToSZT Word16 where
-  toSzt x = toSzt (fromIntegral x :: Word32)  -- Use Word32 container
+  toSzt x = toSzt (fromIntegral x :: Word32) -- Use Word32 container
 
 instance FromSZT Word16 where
   fromSzt dv = do
@@ -133,40 +138,46 @@ instance FromSZT Word16 where
       else Left (StructuralMismatch "Word16 out of range")
 
 instance ToSZT Word32 where
-  toSzt x = DynamicValue
-    { _dvCore = DPrimitive (PWord32 x)
-    , _dvTypeInfo = Just $ TypeInfo
-        { _tiTypeName = Just "Word32"
-        , _tiModule = Just "GHC.Word"
-        , _tiConstructors = []
-        , _tiFieldLabels = []
-        , _tiStructure = Just (TSPrimitive PTWord32)
-        , _tiTypeParameters = []
-        , _tiNewtypeWrapper = Nothing
-        }
-    , _dvSchemaVersion = currentSchemaVersion
-    , _dvShallowId = Nothing
-    }
+  toSzt x =
+    DynamicValue
+      { _dvCore = DPrimitive (PWord32 x),
+        _dvTypeInfo =
+          Just $
+            TypeInfo
+              { _tiTypeName = Just "Word32",
+                _tiModule = Just "GHC.Word",
+                _tiConstructors = [],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSPrimitive PTWord32),
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
+      }
 
 instance FromSZT Word32 where
   fromSzt (DynamicValue (DPrimitive (PWord32 x)) _ _ _) = Right x
   fromSzt _ = Left (PrimitiveMismatch "Word32" "other")
 
 instance ToSZT Word64 where
-  toSzt x = DynamicValue
-    { _dvCore = DPrimitive (PWord64 x)
-    , _dvTypeInfo = Just $ TypeInfo
-        { _tiTypeName = Just "Word64"
-        , _tiModule = Just "GHC.Word"
-        , _tiConstructors = []
-        , _tiFieldLabels = []
-        , _tiStructure = Just (TSPrimitive PTWord64)
-        , _tiTypeParameters = []
-        , _tiNewtypeWrapper = Nothing
-        }
-    , _dvSchemaVersion = currentSchemaVersion
-    , _dvShallowId = Nothing
-    }
+  toSzt x =
+    DynamicValue
+      { _dvCore = DPrimitive (PWord64 x),
+        _dvTypeInfo =
+          Just $
+            TypeInfo
+              { _tiTypeName = Just "Word64",
+                _tiModule = Just "GHC.Word",
+                _tiConstructors = [],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSPrimitive PTWord64),
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
+      }
 
 instance FromSZT Word64 where
   fromSzt (DynamicValue (DPrimitive (PWord64 x)) _ _ _) = Right x
@@ -174,23 +185,26 @@ instance FromSZT Word64 where
 
 -- Integer and Natural
 instance ToSZT Integer where
-  toSzt x = DynamicValue
-    { _dvCore = DPrimitive (PInteger (Text.pack (show x)))
-    , _dvTypeInfo = Just $ TypeInfo
-        { _tiTypeName = Just "Integer"
-        , _tiModule = Just "GHC.Integer"
-        , _tiConstructors = []
-        , _tiFieldLabels = []
-        , _tiStructure = Just (TSPrimitive PTInteger)
-        , _tiTypeParameters = []
-        , _tiNewtypeWrapper = Nothing
-        }
-    , _dvSchemaVersion = currentSchemaVersion
-    , _dvShallowId = Nothing
-    }
+  toSzt x =
+    DynamicValue
+      { _dvCore = DPrimitive (PInteger (Text.pack (show x))),
+        _dvTypeInfo =
+          Just $
+            TypeInfo
+              { _tiTypeName = Just "Integer",
+                _tiModule = Just "GHC.Integer",
+                _tiConstructors = [],
+                _tiFieldLabels = [],
+                _tiStructure = Just (TSPrimitive PTInteger),
+                _tiTypeParameters = [],
+                _tiNewtypeWrapper = Nothing
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
+      }
 
 instance FromSZT Integer where
-  fromSzt (DynamicValue (DPrimitive (PInteger t)) _ _ _) = 
+  fromSzt (DynamicValue (DPrimitive (PInteger t)) _ _ _) =
     case reads (Text.unpack t) of
       [(n, "")] -> Right n
       _ -> Left (StructuralMismatch "Invalid Integer format")
@@ -319,12 +333,12 @@ instance FromSZT Time.NominalDiffTime where
 instance (ToSZT a) => ToSZT (NonEmpty a) where
   toSzt ne = toSzt (NE.toList ne)
 
-instance FromSZT a => FromSZT (NonEmpty a) where
+instance (FromSZT a) => FromSZT (NonEmpty a) where
   fromSzt dv = do
     lst <- fromSzt dv :: Either SZTError [a]
     case lst of
       [] -> Left (StructuralMismatch "NonEmpty cannot be empty")
-      (x:xs) -> Right (x :| xs)
+      (x : xs) -> Right (x :| xs)
 
 -- Map
 instance (ToSZT k, ToSZT v) => ToSZT (Map.Map k v) where
@@ -358,7 +372,7 @@ instance (Hashable a, FromSZT a) => FromSZT (HashSet.HashSet a) where
 instance (ToSZT a) => ToSZT (Vector.Vector a) where
   toSzt v = toSzt (Vector.toList v)
 
-instance FromSZT a => FromSZT (Vector.Vector a) where
+instance (FromSZT a) => FromSZT (Vector.Vector a) where
   fromSzt dv = Vector.fromList <$> fromSzt dv
 
 --------------------------------------------------------------------------------
@@ -367,35 +381,42 @@ instance FromSZT a => FromSZT (Vector.Vector a) where
 
 -- Maybe
 instance (ToSZT a, Typeable a) => ToSZT (Maybe a) where
-  toSzt val = DynamicValue
-    { _dvCore = case val of
-        Nothing -> DSum 0 (DynamicValue DUnit Nothing currentSchemaVersion Nothing)
-        Just x -> DSum 1 (toSzt x)
-    , _dvTypeInfo = Just $ (typeInfoForRep (typeRep (Proxy :: Proxy (Maybe a))))
-        { _tiConstructors = ["Nothing", "Just"] }
-    , _dvSchemaVersion = currentSchemaVersion
-    , _dvShallowId = Nothing
-    }
+  toSzt val =
+    DynamicValue
+      { _dvCore = case val of
+          Nothing -> DSum 0 (DynamicValue DUnit Nothing currentSchemaVersion Nothing)
+          Just x -> DSum 1 (toSzt x),
+        _dvTypeInfo =
+          Just $
+            (typeInfoForRep (typeRep (Proxy :: Proxy (Maybe a))))
+              { _tiConstructors = ["Nothing", "Just"]
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
+      }
 
-instance FromSZT a => FromSZT (Maybe a) where
+instance (FromSZT a) => FromSZT (Maybe a) where
   fromSzt (DynamicValue (DSum 0 _) _ _ _) = Right Nothing
   fromSzt (DynamicValue (DSum 1 v) _ _ _) = Just <$> fromSzt v
   fromSzt _ = Left (StructuralMismatch "Invalid Maybe structure")
 
 -- Either
 instance (ToSZT a, ToSZT b, Typeable a, Typeable b) => ToSZT (Either a b) where
-  toSzt val = DynamicValue
-    { _dvCore = case val of
-        Left x -> DSum 0 (toSzt x)
-        Right y -> DSum 1 (toSzt y)
-    , _dvTypeInfo = Just $ (typeInfoForRep (typeRep (Proxy :: Proxy (Either a b))))
-        { _tiConstructors = ["Left", "Right"] }
-    , _dvSchemaVersion = currentSchemaVersion
-    , _dvShallowId = Nothing
-    }
+  toSzt val =
+    DynamicValue
+      { _dvCore = case val of
+          Left x -> DSum 0 (toSzt x)
+          Right y -> DSum 1 (toSzt y),
+        _dvTypeInfo =
+          Just $
+            (typeInfoForRep (typeRep (Proxy :: Proxy (Either a b))))
+              { _tiConstructors = ["Left", "Right"]
+              },
+        _dvSchemaVersion = currentSchemaVersion,
+        _dvShallowId = Nothing
+      }
 
 instance (FromSZT a, FromSZT b) => FromSZT (Either a b) where
-  fromSzt (DynamicValue (DSum 0 v) _ _ _) = Left  <$> fromSzt v
+  fromSzt (DynamicValue (DSum 0 v) _ _ _) = Left <$> fromSzt v
   fromSzt (DynamicValue (DSum 1 v) _ _ _) = Right <$> fromSzt v
   fromSzt _ = Left (StructuralMismatch "Invalid Either structure")
-
