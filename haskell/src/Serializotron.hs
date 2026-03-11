@@ -157,6 +157,8 @@ import Lens.Family2 qualified as Lens
 import Codec.Compression.GZip qualified as GZip
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO (stderr, hPutStrLn)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, writeIORef, readIORef)
+import Data.Dynamic (Dynamic, fromDynamic, toDyn)
 import Data.Aeson (ToJSON (..), object)
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Lazy qualified as BSL
@@ -2242,6 +2244,32 @@ class FromSZT a where
               ". Constructor order or names have changed.")
       else GHC.Generics.to <$> gFromSZT (_dvCore dynValue)
 
+-- | The default generic 'fromSzt' implementation as a standalone function.
+-- Use with 'memoizedFromSzt' in custom instances:
+--
+-- @
+-- instance FromSZT MyType where
+--   fromSzt = memoizedFromSzt defaultFromSzt
+-- @
+defaultFromSzt
+  :: forall a. (Generic a, GFromSZT (Rep a), GGetAllConstructorNames (Rep a))
+  => DynamicValue -> Either SZTError a
+defaultFromSzt dynValue = do
+  let storedTypeInfo = _dvTypeInfo dynValue
+      expectedConstructors = gGetAllConstructorNames (Proxy @(Rep a ()))
+      storedConstructors = maybe [] (^. tiConstructors) storedTypeInfo
+  if not (null expectedConstructors)
+    && not (null storedConstructors)
+    && storedConstructors /= expectedConstructors
+    then
+      Left $
+        ConstructorMismatch
+          ("constructors " <> Text.intercalate ", " expectedConstructors)
+          ( "constructors " <> Text.intercalate ", " storedConstructors
+              <> ". Constructor order or names have changed."
+          )
+    else GHC.Generics.to <$> gFromSZT (_dvCore dynValue)
+
 -- | Generic deserialization type class
 class GFromSZT f where
   gFromSZT :: DynamicCore -> Either SZTError (f p)
@@ -3597,9 +3625,19 @@ resolveReferences sharedTable rootValue = resolveValue rootValue
     resolvedTable = Map.Lazy.map (>>= resolveValue) sharedTable
 
     resolveValue :: DynamicValue -> Either SerializotronError DynamicValue
-    resolveValue (DynamicValue core typeInfo version shallowId) = do
-      resolvedCore <- resolveCore core
-      return $ DynamicValue resolvedCore typeInfo version shallowId
+    resolveValue (DynamicValue core typeInfo version shallowId) = case core of
+      -- For DReference nodes, return the full resolved DynamicValue from
+      -- the shared table (preserving its shallowId and typeInfo) rather
+      -- than just the DynamicCore. DReference nodes always have Nothing
+      -- metadata, so no information is lost.
+      DReference refId ->
+        case Map.lookup refId resolvedTable of
+          Nothing -> Left $ ValidationError (DanglingReference refId)
+          Just (Left err) -> Left err
+          Just (Right resolvedShared) -> Right resolvedShared
+      _ -> do
+        resolvedCore <- resolveCore core
+        return $ DynamicValue resolvedCore typeInfo version shallowId
 
     resolveCore :: DynamicCore -> Either SerializotronError DynamicCore
     resolveCore = \case
@@ -3609,7 +3647,102 @@ resolveReferences sharedTable rootValue = resolveValue rootValue
       DList vals -> DList <$> traverse resolveValue vals
       DUnit -> return DUnit
       DReference refId ->
+        -- Safety net for bare DReferences inside DynamicCore
         case Map.lookup refId resolvedTable of
           Nothing -> Left $ ValidationError (DanglingReference refId)
           Just (Left err) -> Left err
           Just (Right resolvedShared) -> return $ _dvCore resolvedShared
+
+--------------------------------------------------------------------------------
+-- Memoization for toSzt / fromSzt
+--------------------------------------------------------------------------------
+
+-- | Global cache for 'memoizedToSzt'. Keyed by (TypeRep, shallowId).
+{-# NOINLINE toSztMemoCache #-}
+toSztMemoCache :: IORef (Map.Map (TypeRep, ByteString) DynamicValue)
+toSztMemoCache = unsafePerformIO (newIORef Map.empty)
+
+-- | Clear the toSzt memo cache.
+--
+-- Call before and after each top-level serialisation cycle via
+-- 'withSztMemoization' to avoid stale data or memory leaks.
+resetToSztMemoCache :: IO ()
+resetToSztMemoCache = writeIORef toSztMemoCache Map.empty
+
+-- | Wrap a 'toSzt' implementation with 'ShallowIdentifiable'-based
+-- memoization. Values with the same @(TypeRep, shallowId)@ return the
+-- same 'DynamicValue' pointer, so GHC shares the subtree on the heap.
+--
+-- Usage in a custom 'ToSZT' instance:
+--
+-- @
+-- instance ToSZT MyType where
+--   toSzt = memoizedToSzt $ \\x -> DynamicValue { ... }
+-- @
+--
+-- /Requires 'withSztMemoization' around the serialisation call to reset
+-- the cache./
+{-# NOINLINE memoizedToSzt #-}
+memoizedToSzt
+  :: forall a. (ShallowIdentifiable a, Typeable a)
+  => (a -> DynamicValue) -> a -> DynamicValue
+memoizedToSzt f x = unsafePerformIO $ do
+  let !sid = shallowIdentifier x
+      key = (typeRep (Proxy @a), sid)
+  atomicModifyIORef' toSztMemoCache $ \cache ->
+    case Map.lookup key cache of
+      Just dv -> (cache, dv)
+      Nothing ->
+        let !dv = f x
+        in (Map.insert key dv cache, dv)
+
+-- | Global cache for 'memoizedFromSzt'. Keyed by (TypeRep, shallowId).
+-- Stores values as 'Dynamic' for type-safe heterogeneous storage.
+{-# NOINLINE fromSztMemoCache #-}
+fromSztMemoCache :: IORef (Map.Map (TypeRep, ByteString) Dynamic)
+fromSztMemoCache = unsafePerformIO (newIORef Map.empty)
+
+-- | Clear the fromSzt memo cache.
+resetFromSztMemoCache :: IO ()
+resetFromSztMemoCache = writeIORef fromSztMemoCache Map.empty
+
+-- | Wrap a 'fromSzt' implementation with shallowId-based memoization.
+-- Values with the same @(TypeRep, shallowId)@ are deserialized once and
+-- the Haskell heap object is reused for all subsequent occurrences.
+--
+-- If the 'DynamicValue' has no '_dvShallowId', falls through to the
+-- inner function with no caching.
+--
+-- /Requires 'withSztMemoization' around the deserialisation call./
+{-# NOINLINE memoizedFromSzt #-}
+memoizedFromSzt
+  :: forall a. (Typeable a)
+  => (DynamicValue -> Either SZTError a)
+  -> DynamicValue -> Either SZTError a
+memoizedFromSzt f dv = case _dvShallowId dv of
+  Nothing -> f dv
+  Just sid -> unsafePerformIO $ do
+    let key = (typeRep (Proxy @a), sid)
+    cache <- readIORef fromSztMemoCache
+    case Map.lookup key cache of
+      Just dyn | Just val <- fromDynamic dyn -> pure (Right val)
+      _ -> do
+        let result = f dv
+        case result of
+          Right val ->
+            atomicModifyIORef' fromSztMemoCache $ \c ->
+              (Map.insert key (toDyn val) c, ())
+          Left _ -> pure ()
+        pure result
+
+-- | Run an IO action with memo caches active. Resets both caches
+-- before and after the action, ensuring no leaks or cross-contamination
+-- between serialisation cycles.
+withSztMemoization :: IO a -> IO a
+withSztMemoization action = do
+  resetToSztMemoCache
+  resetFromSztMemoCache
+  result <- action
+  resetToSztMemoCache
+  resetFromSztMemoCache
+  pure result
