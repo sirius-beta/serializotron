@@ -3641,15 +3641,35 @@ resolveReferences sharedTable rootValue = resolveValue rootValue
     -- Map.Strict.map) because strict map forces values to WHNF during
     -- construction, which would cause <<loop>> when entries reference
     -- each other.
+    --
+    -- Each entry is stamped with a synthetic _dvShallowId derived
+    -- from its reference ID. This enables memoizedFromSzt to cache
+    -- the Haskell value produced by fromSzt, restoring the heap
+    -- sharing that the wire format encoded. Without this stamp,
+    -- fromProtoDynamicValue sets _dvShallowId to Nothing and the
+    -- memo cache is bypassed, causing every shared subtree to be
+    -- reconstructed independently.
     resolvedTable :: Map.Map Word32 (Either SerializotronError DynamicValue)
-    resolvedTable = Map.Lazy.map (>>= resolveValue) sharedTable
+    resolvedTable = Map.Lazy.mapWithKey resolveAndStamp sharedTable
+
+    resolveAndStamp :: Word32 -> Either SerializotronError DynamicValue -> Either SerializotronError DynamicValue
+    resolveAndStamp refId edv = do
+      dv <- edv >>= resolveValue
+      -- Preserve the original shallowId from serialisation when
+      -- present; otherwise stamp a synthetic one from the reference
+      -- ID so the fromSzt memo cache can detect sharing.
+      let sid = case _dvShallowId dv of
+            Just existing -> existing
+            Nothing ->
+              BSL.toStrict $ Builder.toLazyByteString $
+                Builder.byteString "ref:" <> Builder.word32Dec refId
+      return $ dv { _dvShallowId = Just sid }
 
     resolveValue :: DynamicValue -> Either SerializotronError DynamicValue
     resolveValue (DynamicValue core typeInfo version shallowId) = case core of
-      -- For DReference nodes, return the full resolved DynamicValue from
-      -- the shared table (preserving its shallowId and typeInfo) rather
-      -- than just the DynamicCore. DReference nodes always have Nothing
-      -- metadata, so no information is lost.
+      -- For DReference nodes, return the full resolved DynamicValue
+      -- from the shared table (with its synthetic shallowId) rather
+      -- than just the DynamicCore.
       DReference refId ->
         case Map.lookup refId resolvedTable of
           Nothing -> Left $ ValidationError (DanglingReference refId)
@@ -3717,8 +3737,13 @@ memoizedToSzt f x = unsafePerformIO $ do
         let !dv = f x
          in (Map.insert key dv cache, dv)
 
--- | Global cache for 'memoizedFromSzt'. Keyed by (TypeRep, shallowId).
+-- | Global cache for 'memoizedFromSzt'. Keyed by @(TypeRep, shallowId)@.
 -- Stores values as 'Dynamic' for type-safe heterogeneous storage.
+--
+-- The shallowId for shared-table entries is stamped by
+-- 'resolveReferences' (synthetic @ref:<id>@ identifier), so entries
+-- that were deduplicated on the wire are cached after the first
+-- @fromSzt@ conversion and reused for every subsequent reference.
 {-# NOINLINE fromSztMemoCache #-}
 fromSztMemoCache :: IORef (Map.Map (TypeRep, ByteString) Dynamic)
 fromSztMemoCache = unsafePerformIO (newIORef Map.empty)
@@ -3727,12 +3752,15 @@ fromSztMemoCache = unsafePerformIO (newIORef Map.empty)
 resetFromSztMemoCache :: IO ()
 resetFromSztMemoCache = writeIORef fromSztMemoCache Map.empty
 
--- | Wrap a 'fromSzt' implementation with shallowId-based memoization.
--- Values with the same @(TypeRep, shallowId)@ are deserialized once and
--- the Haskell heap object is reused for all subsequent occurrences.
+-- | Wrap a 'fromSzt' implementation with shallowId-based
+-- memoization. Values with the same @(TypeRep, shallowId)@ are
+-- deserialised once and the Haskell heap object is reused for all
+-- subsequent occurrences.
 --
--- If the 'DynamicValue' has no '_dvShallowId', falls through to the
--- inner function with no caching.
+-- If the 'DynamicValue' has no '_dvShallowId', falls through to
+-- the inner function with no caching. Shared-table entries always
+-- have a shallowId because 'resolveReferences' stamps them with a
+-- synthetic identifier derived from their reference ID.
 --
 -- /Requires 'withSztMemoization' around the deserialisation call./
 {-# NOINLINE memoizedFromSzt #-}
@@ -3746,12 +3774,22 @@ memoizedFromSzt f dv = case _dvShallowId dv of
   Nothing -> f dv
   Just sid -> unsafePerformIO $ do
     let key = (typeRep (Proxy @a), sid)
-    atomicModifyIORef' fromSztMemoCache $ \cache ->
-      case Map.lookup key cache of
-        Just dyn | Just val <- fromDynamic dyn -> (cache, Right val)
-        _ -> case f dv of
-          Right val -> (Map.insert key (toDyn val) cache, Right val)
-          err -> (cache, err)
+    -- Read-only lookup first. The computation f dv must NOT
+    -- run inside atomicModifyIORef' because it recursively
+    -- calls memoizedFromSzt, which modifies the same IORef.
+    -- Nesting atomicModifyIORef' with unsafePerformIO causes
+    -- <<loop>> when CAS retries re-evaluate the thunk.
+    cache <- readIORef fromSztMemoCache
+    case Map.lookup key cache of
+      Just dyn | Just val <- fromDynamic dyn -> return (Right val)
+      _ -> do
+        let result = f dv
+        case result of
+          Right val ->
+            atomicModifyIORef' fromSztMemoCache $ \c ->
+              (Map.insert key (toDyn val) c, ())
+          _ -> return ()
+        return result
 
 -- | Run an IO action with memo caches active. Resets both caches
 -- before and after the action (even if the action throws), ensuring

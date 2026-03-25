@@ -9,6 +9,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.Hashable (Hashable (..))
 import Data.IORef (readIORef)
+import Data.Maybe (isJust)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text.Encoding (encodeUtf8)
@@ -81,7 +82,7 @@ memoTests =
           Right r -> r @?= w
         resetToSztMemoCache
         resetFromSztMemoCache,
-      testCase "memoizedFromSzt falls through without shallowId" $ do
+      testCase "memoizedFromSzt skips cache without shallowId" $ do
         resetFromSztMemoCache
         let dv =
               DynamicValue
@@ -96,6 +97,29 @@ memoTests =
         cache <- readIORef fromSztMemoCache
         Map.size cache @?= 0
         resetFromSztMemoCache,
+      testCase "resolveReferences stamps shallowId on shared entries" $ do
+        -- Shared-table entries get a synthetic shallowId from
+        -- resolveReferences, enabling memoizedFromSzt to cache them.
+        let sharedDV =
+              DynamicValue
+                { _dvCore = DPrimitive (PInt 99),
+                  _dvTypeInfo = Nothing,
+                  _dvSchemaVersion = currentSchemaVersion,
+                  _dvShallowId = Nothing
+                }
+            sharedTable = Map.singleton 0 (Right sharedDV)
+            rootRef =
+              DynamicValue
+                { _dvCore = DReference 0,
+                  _dvTypeInfo = Nothing,
+                  _dvSchemaVersion = currentSchemaVersion,
+                  _dvShallowId = Nothing
+                }
+        case resolveReferences sharedTable rootRef of
+          Left err -> assertBool ("resolve failed: " <> show err) False
+          Right resolved ->
+            assertBool "shared entry should have shallowId"
+              (isJust $ _dvShallowId resolved),
       testCase "withSztMemoization resets caches" $ do
         let _dv = toSzt (Widget "pre" 1)
         withSztMemoization $ do
