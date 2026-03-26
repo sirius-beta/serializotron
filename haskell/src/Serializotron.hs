@@ -3661,9 +3661,10 @@ resolveReferences sharedTable rootValue = resolveValue rootValue
       let sid = case _dvShallowId dv of
             Just existing -> existing
             Nothing ->
-              BSL.toStrict $ Builder.toLazyByteString $
-                Builder.byteString "ref:" <> Builder.word32Dec refId
-      return $ dv { _dvShallowId = Just sid }
+              BSL.toStrict $
+                Builder.toLazyByteString $
+                  Builder.byteString "ref:" <> Builder.word32Dec refId
+      return $ dv {_dvShallowId = Just sid}
 
     resolveValue :: DynamicValue -> Either SerializotronError DynamicValue
     resolveValue (DynamicValue core typeInfo version shallowId) = case core of

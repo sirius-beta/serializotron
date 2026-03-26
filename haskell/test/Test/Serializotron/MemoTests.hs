@@ -9,8 +9,8 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.Hashable (Hashable (..))
 import Data.IORef (readIORef)
-import Data.Maybe (isJust)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text.Encoding (encodeUtf8)
 import Data.Typeable (Proxy (..), Typeable, typeRep)
@@ -118,7 +118,8 @@ memoTests =
         case resolveReferences sharedTable rootRef of
           Left err -> assertBool ("resolve failed: " <> show err) False
           Right resolved ->
-            assertBool "shared entry should have shallowId"
+            assertBool
+              "shared entry should have shallowId"
               (isJust $ _dvShallowId resolved),
       testCase "withSztMemoization resets caches" $ do
         let _dv = toSzt (Widget "pre" 1)
